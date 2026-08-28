@@ -14,7 +14,7 @@ import subprocess
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, BinaryIO, Literal
 
 from starlette.responses import Response, StreamingResponse
 
@@ -906,6 +906,15 @@ class LocalStorageProvider:
             expected_kind=MEDIA_REF_KIND,
         )
         return path
+
+    def open_cover_source(self, *, media: MediaHandle) -> BinaryIO:
+        path = self._media_path(media, operation="open_cover_source")
+        try:
+            return path.open("rb")
+        except OSError as exc:
+            raise _provider_error(
+                "open_cover_source", "unavailable", "媒体读取失败", retryable=True
+            ) from exc
 
     def compute_file_hash(self, *, media: MediaHandle) -> str:
         operation = "compute_file_hash"

@@ -315,6 +315,17 @@ def test_compute_file_hash_rejects_stale_media_size(tmp_path: Path) -> None:
     assert error.value.code == "unavailable"
 
 
+def test_open_cover_source_returns_a_seekable_media_file(tmp_path: Path) -> None:
+    provider, library, media_root, _import_root = _provider(tmp_path)
+    path = media_root / "videos/clip.mp4"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"media")
+
+    with provider.open_cover_source(media=_media(library, "videos/clip.mp4")) as source:
+        assert source.seekable()
+        assert source.read() == b"media"
+
+
 def test_thumbnails_decode_once_and_write_webp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     provider, library, media_root, _import_root = _provider(tmp_path)
     path = media_root / "videos/clip.mp4"
