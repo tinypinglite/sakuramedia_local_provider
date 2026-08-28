@@ -1,0 +1,132 @@
+name: Release Plugin
+run-name: Release ${{ github.event.release.tag_name }}
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: plugin-release-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+env:
+  DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Validate release request
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          IS_PRERELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          set -euo pipefail
+
+          if [ "$IS_PRERELEASE" = "true" ]; then
+            echo "::error::Pre-release does not trigger plugin publish"
+            exit 1
+          fi
+
+          if ! [[ "$TAG" =~ ^v[0-9][0-9A-Za-z._-]*$ ]]; then
+            echo "::error::Tag must match v<version>"
+            exit 1
+          fi
+
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Validate tag belongs to default branch
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          DEFAULT_BRANCH: ${{ env.DEFAULT_BRANCH }}
+        run: |
+          set -euo pipefail
+
+          git fetch --force origin "refs/heads/$DEFAULT_BRANCH:refs/remotes/origin/$DEFAULT_BRANCH"
+          git fetch --force --tags origin
+
+          if ! git rev-parse --verify --quiet "refs/tags/$TAG^{commit}" >/dev/null; then
+            echo "::error::Release tag does not exist"
+            exit 1
+          fi
+
+          tag_commit="$(git rev-list -n 1 "$TAG")"
+          if ! git merge-base --is-ancestor "$tag_commit" "origin/$DEFAULT_BRANCH"; then
+            echo "::error::Release tag is not on the default branch"
+            exit 1
+          fi
+
+      - name: Validate plugin version
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+
+          tag_version="${TAG#v}"
+          manifest_version="$(python -c 'import json; print(json.load(open("manifest.json"))["version"])')"
+          plugin_version="$(python - <<'PY'
+          import ast
+
+          module = ast.parse(open("plugin.py").read())
+          print(
+              next(
+                  ast.literal_eval(node.value)
+                  for node in module.body
+                  if isinstance(node, ast.Assign)
+                  and any(
+                      isinstance(target, ast.Name) and target.id == "VERSION"
+                      for target in node.targets
+                  )
+              )
+          )
+          PY
+          )"
+
+          if [ "$manifest_version" != "$tag_version" ] || [ "$plugin_version" != "$tag_version" ]; then
+            echo "::error::Version mismatch between tag, manifest.json, and plugin.py"
+            exit 1
+          fi
+
+      - name: Compile plugin source
+        run: python -m compileall -q *.py
+
+      - name: Build allowlisted plugin zip
+        id: build
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+
+          zip_name="sakuramedia_local_provider-${TAG#v}.zip"
+          package_dir="$(mktemp -d)"
+          cp README.md manifest.json "$package_dir/"
+          find . -maxdepth 1 -type f -name '*.py' -exec cp {} "$package_dir/" \;
+          (
+            cd "$package_dir"
+            zip -q -r "$GITHUB_WORKSPACE/$zip_name" .
+          )
+          sha256sum "$zip_name" > "$zip_name.sha256"
+          echo "zip=$zip_name" >> "$GITHUB_OUTPUT"
+          echo "checksum=$zip_name.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" "${{ steps.build.outputs.zip }}" "${{ steps.build.outputs.checksum }}" --clobber
