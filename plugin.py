@@ -24,7 +24,7 @@ from .storage import LocalStorageProvider, _reject_symlink_components
 
 PLUGIN_ID = "sakuramedia_local_provider"
 DISPLAY_NAME = "本地存储与 qBittorrent"
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 
 LIBRARY_CONFIG_FIELDS = (
     ConfigField(
@@ -61,6 +61,7 @@ class LocalMediaProviderBundle:
     display_name = DISPLAY_NAME
     library_config_fields = LIBRARY_CONFIG_FIELDS
     playback_deliveries = ("proxy",)
+    merged_playback_format = "mp4"
 
     def __init__(self, *, data_dir: Path) -> None:
         self.data_dir = data_dir

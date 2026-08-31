@@ -16,8 +16,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, BinaryIO, Literal
 
-from starlette.responses import Response, StreamingResponse
-
 from src.plugins.provider_protocol import (
     BrowseEntry,
     BrowsePage,
@@ -34,6 +32,9 @@ from src.plugins.provider_protocol import (
     ThumbnailArtifact,
     ThumbnailGeneration,
 )
+from starlette.responses import Response, StreamingResponse
+
+from .merged_playback import Mp4MergeError, build_layout, merged_range_requests_response
 
 LOCAL_REF_VERSION = 1
 MEDIA_REF_KIND = "media_local_path"
@@ -1094,6 +1095,29 @@ class LocalStorageProvider:
             media_type=media_type,
             headers=headers,
         )
+
+    async def handle_merged_playback(
+        self,
+        *,
+        medias: tuple[MediaHandle, ...],
+        context: PlaybackContext,
+    ) -> Response:
+        if context.resource_path != "stream.mp4":
+            raise _provider_error("merged_playback", "source_not_found", "本地合并播放资源不存在")
+        try:
+            layout = build_layout(
+                [
+                    (media.media_id, self._media_path(media, operation="merged_playback"))
+                    for media in medias
+                ]
+            )
+        except Mp4MergeError as exc:
+            raise _provider_error("merged_playback", "unsupported", exc.message) from exc
+        except OSError as exc:
+            raise _provider_error(
+                "merged_playback", "unavailable", "媒体文件读取失败", retryable=True
+            ) from exc
+        return merged_range_requests_response(context.request, layout, "video/mp4")
 
     def generate_thumbnails(self, *, media: MediaHandle, workspace: Path) -> ThumbnailGeneration:
         source = self._media_path(media, operation="generate_thumbnails")

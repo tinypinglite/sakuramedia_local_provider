@@ -43,11 +43,12 @@ def _media(
     library: LibraryHandle,
     relative_path: str,
     *,
+    media_id: int = 1,
     duration: int = 20,
     file_size_bytes: int = 0,
 ) -> MediaHandle:
     return MediaHandle(
-        media_id=1,
+        media_id=media_id,
         library=library,
         storage_ref={"version": 1, "kind": "media_local_path", "relative_path": relative_path},
         file_name=Path(relative_path).name,
@@ -261,6 +262,59 @@ def test_playback_supports_one_range_and_rejects_escape(tmp_path: Path) -> None:
         )
     assert "/" not in error.value.safe_message
     assert str(tmp_path) not in error.value.safe_message
+
+
+def test_merged_playback_uses_ordered_local_media_and_range_response(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    provider, library, media_root, _import_root = _provider(tmp_path)
+    first_path = media_root / "videos/part-1.mp4"
+    second_path = media_root / "videos/part-2.mp4"
+    first_path.parent.mkdir(parents=True)
+    first_path.write_bytes(b"first")
+    second_path.write_bytes(b"second")
+    seen: dict[str, object] = {}
+
+    class Layout:
+        total_size = 10
+
+        @staticmethod
+        def resolve_range(start: int, end: int):
+            return [("mem", b"0123456789"[start:end], 0, 0)]
+
+    def build_fake_layout(entries):
+        seen["entries"] = entries
+        return Layout()
+
+    monkeypatch.setattr(storage_module, "build_layout", build_fake_layout)
+    request = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/",
+            "headers": [(b"range", b"bytes=2-5")],
+        }
+    )
+    response = asyncio.run(
+        provider.handle_merged_playback(
+            medias=(
+                _media(library, "videos/part-1.mp4", media_id=1),
+                _media(library, "videos/part-2.mp4", media_id=2),
+            ),
+            context=PlaybackContext(
+                request=request,
+                resource_path="stream.mp4",
+                delivery="proxy",
+                url_for=lambda value: value,
+            ),
+        )
+    )
+
+    assert response.status_code == 206
+    assert response.headers["content-range"] == "bytes 2-5/10"
+    assert asyncio.run(_response_body(response)) == b"2345"
+    assert seen["entries"] == [(1, first_path), (2, second_path)]
 
 
 def test_compute_file_hash_matches_protocol_vector(tmp_path: Path) -> None:
