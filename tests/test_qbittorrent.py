@@ -403,7 +403,7 @@ def test_submit_existing_unmanaged_torrent_is_rejected_without_tagging(provider)
                 display_name="ABC",
             )
         )
-    assert error.value.code == "source_not_found"
+    assert error.value.code == "task_not_managed"
     assert fake.tag_calls == []
 
 
@@ -559,7 +559,7 @@ def test_delete_only_managed_tasks_and_is_idempotent(provider) -> None:
     fake.items = [SimpleNamespace(hash=HASH, tags="sakuramedia,client:99")]
     with pytest.raises(ProviderOperationError) as error:
         client.delete_task(remote_id=HASH, delete_files=False)
-    assert error.value.code == "source_not_found"
+    assert error.value.code == "task_not_managed"
     assert HASH not in error.value.safe_message
 
     class NotFound404Error(Exception):

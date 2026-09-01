@@ -66,6 +66,7 @@ def _error(
         "invalid_config",
         "authentication_failed",
         "source_not_found",
+        "task_not_managed",
         "source_blacklisted",
         "unsupported",
         "unavailable",
@@ -924,7 +925,7 @@ class QbittorrentDownloadProvider:
         if item is None:
             raise _error("submit", "unavailable", "qBittorrent 未返回已提交任务", retryable=True)
         if not _managed(_value(item, "tags", ""), self.client_handle.client_id):
-            raise _error("submit", "source_not_found", "同哈希下载任务已存在且不受当前客户端管理")
+            raise _error("submit", "task_not_managed", "同哈希下载任务已存在且不受当前客户端管理")
         task = self._task(item)
         if task is None:
             raise _error("submit", "unavailable", "qBittorrent 任务信息无效", retryable=True)
@@ -1039,7 +1040,7 @@ class QbittorrentDownloadProvider:
         if item is None:
             return
         if not _managed(_value(item, "tags", ""), self.client_handle.client_id):
-            raise _error("delete_task", "source_not_found", "下载任务不存在或不受管理")
+            raise _error("delete_task", "task_not_managed", "下载任务不受当前客户端管理")
         try:
             self.client.torrents_delete(
                 torrent_hashes=remote_id.strip(),
