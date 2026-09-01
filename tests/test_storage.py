@@ -391,7 +391,9 @@ def test_open_cover_source_returns_a_seekable_media_file(tmp_path: Path) -> None
         assert source.read() == b"media"
 
 
-def test_thumbnails_decode_once_and_write_webp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_thumbnails_seek_each_offset_and_write_webp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     provider, library, media_root, _import_root = _provider(tmp_path)
     path = media_root / "videos/clip.mp4"
     path.parent.mkdir(parents=True)
@@ -411,24 +413,39 @@ def test_thumbnails_decode_once_and_write_webp(tmp_path: Path, monkeypatch: pyte
         stream = SimpleNamespace(type="video", time_base=1)
         streams = SimpleNamespace(video=(stream,))
 
+        def __init__(self):
+            self.seek_calls = []
+            self.decode_calls = 0
+
         def __enter__(self):
             return self
 
         def __exit__(self, *_args):
             return None
 
+        def seek(self, timestamp, *, stream, backward, any_frame):
+            assert stream is self.stream
+            assert backward is True
+            assert any_frame is False
+            self.seek_calls.append(timestamp)
+
         def decode(self, stream):
             assert stream is self.stream
-            return iter((FakeFrame(0), FakeFrame(10)))
+            self.decode_calls += 1
+            return iter((FakeFrame(0),))
 
-    fake_av = SimpleNamespace(open=lambda _path: FakeContainer())
+    container = FakeContainer()
+    fake_av = SimpleNamespace(open=lambda _path: container)
     monkeypatch.setitem(sys.modules, "av", fake_av)
+    monkeypatch.setattr(storage_module.os, "nice", lambda _value: 0)
     workspace = tmp_path / "thumbs"
     generation = provider.generate_thumbnails(
-        media=_media(library, "videos/clip.mp4", duration=10), workspace=workspace
+        media=_media(library, "videos/clip.mp4", duration=20), workspace=workspace
     )
-    assert generation.expected_count == 2
-    assert [artifact.offset_seconds for artifact in generation.artifacts] == [0, 10]
+    assert generation.expected_count == 3
+    assert [artifact.offset_seconds for artifact in generation.artifacts] == [0, 10, 20]
+    assert container.seek_calls == [10, 20]
+    assert container.decode_calls == 3
     assert all((workspace / artifact.relative_path).read_bytes().startswith(b"RIFF") for artifact in generation.artifacts)
 
 

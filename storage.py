@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
+import logging
 import mimetypes
 import os
 import re
@@ -36,6 +36,8 @@ from src.service.playback.media_metadata_probe_service import MediaMetadataProbe
 from starlette.responses import Response, StreamingResponse
 
 from .merged_playback import Mp4MergeError, build_layout, merged_range_requests_response
+
+logger = logging.getLogger(__name__)
 
 LOCAL_REF_VERSION = 1
 MEDIA_REF_KIND = "media_local_path"
@@ -914,6 +916,13 @@ class LocalStorageProvider:
     def _probe_file_duration_seconds(path: Path) -> int:
         return max(0, int(MediaMetadataProbeService.probe_file(path).duration_seconds or 0))
 
+    @staticmethod
+    def _lower_process_priority() -> None:
+        try:
+            os.nice(19)
+        except (AttributeError, OSError):
+            return
+
     def probe_duration_seconds(self, *, media: MediaHandle) -> int:
         return self._probe_file_duration_seconds(
             self._media_path(media, operation="probe_duration_seconds")
@@ -1141,11 +1150,8 @@ class LocalStorageProvider:
                 "generate_thumbnails", "unavailable", "缩略图组件不可用", retryable=True
             ) from exc
 
-        duration_hint = max(0.0, float(media.duration_seconds or 0))
-        next_offset = 0
-        max_timestamp = duration_hint
-        previous_frame: Any | None = None
-        previous_timestamp = 0.0
+        interval_seconds = 10
+        duration_seconds = max(0, int(media.duration_seconds or 0))
         artifacts: list[ThumbnailArtifact] = []
 
         def write_thumbnail(frame: Any, offset: int) -> None:
@@ -1179,43 +1185,68 @@ class LocalStorageProvider:
                     temporary.unlink(missing_ok=True)
 
         try:
+            self._lower_process_priority()
             with av.open(str(source)) as container:
-                stream = container.streams.video[0]
-                time_base = float(stream.time_base or 0)
-                decoded = container.decode(stream)
-                for frame in decoded:
-                    timestamp = frame.time
-                    pts = frame.pts
-                    if timestamp is None and pts is not None and time_base:
-                        timestamp = pts * time_base
-                    timestamp = max(0.0, float(timestamp or 0.0))
-                    max_timestamp = max(max_timestamp, timestamp)
-                    if previous_frame is None:
-                        previous_frame = frame
-                        previous_timestamp = timestamp
-                    while next_offset <= int(timestamp):
-                        if abs(previous_timestamp - next_offset) <= abs(timestamp - next_offset):
-                            selected = previous_frame
+                video_streams = getattr(container.streams, "video", ())
+                if not video_streams:
+                    raise _provider_error(
+                        "generate_thumbnails", "unavailable", "视频流不存在", retryable=True
+                    )
+                stream = video_streams[0]
+                if duration_seconds <= 0:
+                    stream_duration = getattr(stream, "duration", None)
+                    stream_time_base = getattr(stream, "time_base", None)
+                    if stream_duration is not None and stream_time_base:
+                        duration_seconds = max(0, int(float(stream_duration * stream_time_base)))
+                    if duration_seconds <= 0:
+                        container_duration = getattr(container, "duration", None)
+                        av_time_base = getattr(av, "time_base", None)
+                        if container_duration is not None and av_time_base:
+                            duration_seconds = max(
+                                0, int(float(container_duration / av_time_base))
+                            )
+                if duration_seconds <= 0:
+                    return ThumbnailGeneration(expected_count=0, artifacts=())
+
+                for offset in range(0, duration_seconds + 1, interval_seconds):
+                    try:
+                        if offset == 0:
+                            frame = next(container.decode(stream))
                         else:
-                            selected = frame
-                        write_thumbnail(selected, next_offset)
-                        next_offset += 10
-                    previous_frame = frame
-                    previous_timestamp = timestamp
+                            time_base = float(stream.time_base or 0)
+                            if time_base <= 0:
+                                raise ValueError("video stream time base is missing")
+                            timestamp = int(offset / time_base)
+                            container.seek(
+                                timestamp,
+                                stream=stream,
+                                backward=True,
+                                any_frame=False,
+                            )
+                            frame = next(container.decode(stream))
+                        write_thumbnail(frame, offset)
+                    except StopIteration:
+                        logger.warning(
+                            "Local thumbnail frame missing media_id=%s offset_seconds=%s",
+                            media.media_id,
+                            offset,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - keep old per-offset recovery
+                        logger.warning(
+                            "Local thumbnail frame failed media_id=%s offset_seconds=%s detail=%s",
+                            media.media_id,
+                            offset,
+                            exc,
+                        )
         except ProviderOperationError:
             raise
         except Exception as exc:
             raise _provider_error(
                 "generate_thumbnails", "unavailable", "视频解码失败", retryable=True
             ) from exc
-        if previous_frame is None:
+        if not artifacts:
             raise _provider_error("generate_thumbnails", "source_not_found", "视频没有可用画面")
-        duration = max(0.0, duration_hint, max_timestamp)
-        expected_count = max(1, math.floor(duration / 10.0) + 1)
-        while next_offset < expected_count * 10:
-            offset = next_offset
-            write_thumbnail(previous_frame, offset)
-            next_offset += 10
+        expected_count = max(1, duration_seconds // interval_seconds + 1)
         return ThumbnailGeneration(expected_count=expected_count, artifacts=tuple(artifacts))
 
     def create_clip(
