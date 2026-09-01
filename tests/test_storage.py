@@ -9,8 +9,6 @@ from types import SimpleNamespace
 import pytest
 import sakuramedia_local_provider.storage as storage_module
 from sakuramedia_local_provider.storage import LocalStorageProvider
-from starlette.requests import Request
-
 from src.plugins.provider_protocol import (
     ImportPlacement,
     LibraryHandle,
@@ -18,6 +16,7 @@ from src.plugins.provider_protocol import (
     PlaybackContext,
     ProviderOperationError,
 )
+from starlette.requests import Request
 
 
 async def _response_body(response) -> bytes:
@@ -90,7 +89,14 @@ def test_browse_scan_refs_are_relative_and_symlinks_are_ignored(tmp_path: Path) 
     }
 
 
-def test_stage_is_idempotent_and_layout_has_operation_version(tmp_path: Path) -> None:
+def test_stage_is_idempotent_and_layout_has_operation_version(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        storage_module.MediaMetadataProbeService,
+        "probe_file",
+        lambda _path: SimpleNamespace(duration_seconds=42),
+    )
     provider, library, media_root, import_root = _provider(tmp_path)
     source_path = import_root / "ABC-001.mp4"
     source_path.write_bytes(b"source")
@@ -113,6 +119,8 @@ def test_stage_is_idempotent_and_layout_has_operation_version(tmp_path: Path) ->
     )
     assert first.storage_ref == second.storage_ref
     assert first.receipt == second.receipt
+    assert first.duration_seconds == 42
+    assert second.duration_seconds == 42
     target = media_root / "jav/ABC-001/import-1/ABC-001.mp4"
     assert target.read_bytes() == b"source"
     assert os.stat(target).st_ino == os.stat(source_path).st_ino
@@ -125,6 +133,9 @@ def test_stage_is_idempotent_and_layout_has_operation_version(tmp_path: Path) ->
     )
     assert newer.storage_ref != first.storage_ref
     assert (media_root / "jav/ABC-001/import-2/ABC-001.mp4").is_file()
+    assert provider.probe_duration_seconds(
+        media=_media(library, first.storage_ref["relative_path"])
+    ) == 42
     provider.delete_media(media=_media(library, first.storage_ref["relative_path"]))
     assert not target.exists()
     provider.delete_media(media=_media(library, first.storage_ref["relative_path"]))

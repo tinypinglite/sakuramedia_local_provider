@@ -32,6 +32,7 @@ from src.plugins.provider_protocol import (
     ThumbnailArtifact,
     ThumbnailGeneration,
 )
+from src.service.playback.media_metadata_probe_service import MediaMetadataProbeService
 from starlette.responses import Response, StreamingResponse
 
 from .merged_playback import Mp4MergeError, build_layout, merged_range_requests_response
@@ -704,6 +705,7 @@ class LocalStorageProvider:
         except (TypeError, ValueError) as exc:
             raise _provider_error("stage_import_file", "invalid_config", "导入操作标识无效") from exc
         source_path, source_relative, source_identity = self._source_for(source)
+        duration_seconds = self._probe_file_duration_seconds(source_path)
         if source_disposition == "delete_after_commit":
             self._reject_media_library_source(source_path, operation="stage_import_file")
         try:
@@ -737,7 +739,7 @@ class LocalStorageProvider:
                         storage_ref=self._media_ref(target_relative),
                         receipt={"operation_key": operation_name, "token": existing["token"]},
                         size_bytes=existing["target_size"],
-                        duration_seconds=None,
+                        duration_seconds=duration_seconds,
                         video_info=None,
                     )
             if target.exists() or target.is_symlink():
@@ -821,7 +823,7 @@ class LocalStorageProvider:
             storage_ref=self._media_ref(target_relative),
             receipt=receipt,
             size_bytes=journal["target_size"],
-            duration_seconds=None,
+            duration_seconds=duration_seconds,
             video_info=None,
         )
 
@@ -907,6 +909,15 @@ class LocalStorageProvider:
             expected_kind=MEDIA_REF_KIND,
         )
         return path
+
+    @staticmethod
+    def _probe_file_duration_seconds(path: Path) -> int:
+        return max(0, int(MediaMetadataProbeService.probe_file(path).duration_seconds or 0))
+
+    def probe_duration_seconds(self, *, media: MediaHandle) -> int:
+        return self._probe_file_duration_seconds(
+            self._media_path(media, operation="probe_duration_seconds")
+        )
 
     def open_cover_source(self, *, media: MediaHandle) -> BinaryIO:
         path = self._media_path(media, operation="open_cover_source")

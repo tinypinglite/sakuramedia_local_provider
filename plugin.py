@@ -24,7 +24,7 @@ from .storage import LocalStorageProvider, _reject_symlink_components
 
 PLUGIN_ID = "sakuramedia_local_provider"
 DISPLAY_NAME = "本地存储与 qBittorrent"
-VERSION = "0.1.3"
+VERSION = "0.1.4"
 
 LIBRARY_CONFIG_FIELDS = (
     ConfigField(
