@@ -1091,23 +1091,16 @@ class LocalStorageProvider:
             )
         if context.request.method.upper() == "HEAD":
             return Response(status_code=status_code, media_type=media_type, headers=headers)
-        try:
-            handle = path.open("rb")
-            handle.seek(start)
-        except OSError as exc:
-            raise _provider_error("playback", "unavailable", "媒体读取失败", retryable=True) from exc
-
-        async def stream():
-            remaining = length
-            try:
+        def stream():
+            with path.open("rb") as handle:
+                handle.seek(start)
+                remaining = length
                 while remaining:
                     chunk = handle.read(min(1024 * 1024, remaining))
                     if not chunk:
                         break
                     remaining -= len(chunk)
                     yield chunk
-            finally:
-                handle.close()
 
         return StreamingResponse(
             stream(),
