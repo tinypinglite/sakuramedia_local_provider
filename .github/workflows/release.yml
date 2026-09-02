@@ -78,26 +78,9 @@ jobs:
 
           tag_version="${TAG#v}"
           manifest_version="$(python -c 'import json; print(json.load(open("manifest.json"))["version"])')"
-          plugin_version="$(python - <<'PY'
-          import ast
 
-          module = ast.parse(open("plugin.py").read())
-          print(
-              next(
-                  ast.literal_eval(node.value)
-                  for node in module.body
-                  if isinstance(node, ast.Assign)
-                  and any(
-                      isinstance(target, ast.Name) and target.id == "VERSION"
-                      for target in node.targets
-                  )
-              )
-          )
-          PY
-          )"
-
-          if [ "$manifest_version" != "$tag_version" ] || [ "$plugin_version" != "$tag_version" ]; then
-            echo "::error::Version mismatch between tag, manifest.json, and plugin.py"
+          if [ "$manifest_version" != "$tag_version" ]; then
+            echo "::error::Version mismatch between tag and manifest.json"
             exit 1
           fi
 

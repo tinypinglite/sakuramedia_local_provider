@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from src.plugins import (
@@ -24,7 +25,9 @@ from .storage import LocalStorageProvider, _reject_symlink_components
 
 PLUGIN_ID = "sakuramedia_local_provider"
 DISPLAY_NAME = "本地存储与 qBittorrent"
-VERSION = "0.1.8"
+VERSION = json.loads(
+    Path(__file__).with_name("manifest.json").read_text(encoding="utf-8")
+)["version"]
 
 LIBRARY_CONFIG_FIELDS = (
     ConfigField(
