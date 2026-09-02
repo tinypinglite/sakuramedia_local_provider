@@ -356,6 +356,16 @@ class LocalStorageProvider:
         result.sort(key=lambda item: (item.relative_path.casefold(), item.relative_path))
         return tuple(result)
 
+    def get_import_source_identity(self, *, source: ImportFile) -> str:
+        path, _relative, identity = self._source_for(source)
+        payload = json.dumps(
+            {"path": str(path), **identity},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return f"local-import-source-v1:{hashlib.sha256(payload).hexdigest()}"
+
     def read_import_file(self, *, source: ImportFile) -> ImportFileContent:
         path, relative, identity = self._source_for(source)
         try:

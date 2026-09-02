@@ -90,6 +90,38 @@ def test_browse_scan_refs_are_relative_and_symlinks_are_ignored(tmp_path: Path) 
     }
 
 
+def test_import_source_identity_tracks_source_content_and_location(
+    tmp_path: Path,
+) -> None:
+    provider, _library, _media_root, import_root = _provider(tmp_path)
+    source_path = import_root / "clip.mp4"
+    source_path.write_bytes(b"source")
+    root_ref = {"version": 1, "kind": "manual_local_path", "relative_path": ""}
+
+    source = provider.scan_import_source(source_ref=root_ref)[0]
+    identity = provider.get_import_source_identity(source=source)
+    assert (
+        provider.get_import_source_identity(
+            source=provider.scan_import_source(source_ref=root_ref)[0]
+        )
+        == identity
+    )
+
+    source_path.write_bytes(b"changed source")
+    changed_identity = provider.get_import_source_identity(
+        source=provider.scan_import_source(source_ref=root_ref)[0]
+    )
+    assert changed_identity != identity
+
+    source_path.rename(import_root / "renamed.mp4")
+    assert (
+        provider.get_import_source_identity(
+            source=provider.scan_import_source(source_ref=root_ref)[0]
+        )
+        != changed_identity
+    )
+
+
 def test_stage_is_idempotent_and_layout_has_operation_version(
     tmp_path: Path, monkeypatch
 ) -> None:
