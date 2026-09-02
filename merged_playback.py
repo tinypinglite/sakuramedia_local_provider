@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from collections.abc import Iterable
 from pathlib import Path
@@ -19,6 +20,7 @@ from .merged_mp4 import (
 
 _CACHE_TTL_SECONDS = 300
 _cache: dict[tuple[tuple[int, str, int, int], ...], tuple[float, MergedLayout]] = {}
+_cache_lock = threading.Lock()
 
 
 def _cache_key(entries: list[tuple[int, Path]]) -> tuple[tuple[int, str, int, int], ...]:
@@ -38,21 +40,22 @@ def _cleanup_cache(now: float) -> None:
 
 
 def build_layout(entries: list[tuple[int, Path]]) -> MergedLayout:
-    if len(entries) < 2:
-        raise Mp4MergeError(
-            "合并播放至少需要 2 个分段",
-            error_code="merged_mp4_need_at_least_two",
-        )
-    cache_key = _cache_key(entries)
-    now = time.monotonic()
-    _cleanup_cache(now)
-    cached = _cache.get(cache_key)
-    if cached is not None and now - cached[0] <= _CACHE_TTL_SECONDS:
-        return cached[1]
+    with _cache_lock:
+        if len(entries) < 2:
+            raise Mp4MergeError(
+                "合并播放至少需要 2 个分段",
+                error_code="merged_mp4_need_at_least_two",
+            )
+        cache_key = _cache_key(entries)
+        now = time.monotonic()
+        _cleanup_cache(now)
+        cached = _cache.get(cache_key)
+        if cached is not None and now - cached[0] <= _CACHE_TTL_SECONDS:
+            return cached[1]
 
-    layout = build_merged_layout([parse_file(str(path)) for _media_id, path in entries])
-    _cache[cache_key] = (now, layout)
-    return layout
+        layout = build_merged_layout([parse_file(str(path)) for _media_id, path in entries])
+        _cache[cache_key] = (now, layout)
+        return layout
 
 
 def _get_range_header(range_header: str, file_size: int) -> tuple[int, int]:

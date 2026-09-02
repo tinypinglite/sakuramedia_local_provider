@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -1118,12 +1119,11 @@ class LocalStorageProvider:
         if context.resource_path != "stream.mp4":
             raise _provider_error("merged_playback", "source_not_found", "本地合并播放资源不存在")
         try:
-            layout = build_layout(
-                [
-                    (media.media_id, self._media_path(media, operation="merged_playback"))
-                    for media in medias
-                ]
-            )
+            entries = [
+                (media.media_id, self._media_path(media, operation="merged_playback"))
+                for media in medias
+            ]
+            layout = await asyncio.to_thread(build_layout, entries)
         except Mp4MergeError as exc:
             raise _provider_error("merged_playback", "unsupported", exc.message) from exc
         except OSError as exc:

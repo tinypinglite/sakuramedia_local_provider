@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -296,6 +297,7 @@ def test_merged_playback_uses_ordered_local_media_and_range_response(
 
     def build_fake_layout(entries):
         seen["entries"] = entries
+        seen["thread_id"] = threading.get_ident()
         return Layout()
 
     monkeypatch.setattr(storage_module, "build_layout", build_fake_layout)
@@ -326,6 +328,7 @@ def test_merged_playback_uses_ordered_local_media_and_range_response(
     assert response.headers["content-range"] == "bytes 2-5/10"
     assert asyncio.run(_response_body(response)) == b"2345"
     assert seen["entries"] == [(1, first_path), (2, second_path)]
+    assert seen["thread_id"] != threading.get_ident()
 
 
 def test_compute_file_hash_matches_protocol_vector(tmp_path: Path) -> None:
