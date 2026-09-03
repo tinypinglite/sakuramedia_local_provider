@@ -219,6 +219,59 @@ class LocalStorageProvider:
             "relative_path": relative_path,
         }
 
+    def scan_managed_media_ref_keys(self) -> set[str]:
+        """Enumerate regular files below the configured media root for validity checks."""
+        try:
+            _reject_symlink_components(self.media_root)
+            media_root = self.media_root.resolve(strict=False)
+            candidates = list(self.media_root.rglob("*"))
+        except (OSError, ValueError) as exc:
+            raise _provider_error(
+                "scan_managed_media_ref_keys",
+                "unavailable",
+                "本地媒体目录读取失败",
+                retryable=True,
+            ) from exc
+        relative_paths: set[str] = set()
+        for path in candidates:
+            try:
+                if path.is_symlink() or not path.is_file():
+                    continue
+                _reject_symlink_components(path)
+                _ensure_under(path.resolve(strict=True), media_root)
+                relative_path = _posix_relative(path, self.media_root)
+            except ValueError:
+                continue
+            except OSError as exc:
+                raise _provider_error(
+                    "scan_managed_media_ref_keys",
+                    "unavailable",
+                    "本地媒体文件读取失败",
+                    retryable=True,
+                ) from exc
+            relative_paths.add(relative_path)
+        return relative_paths
+
+    @staticmethod
+    def managed_media_ref_key(*, media_ref: JsonObject) -> str:
+        if (
+            media_ref.get("version") != LOCAL_REF_VERSION
+            or media_ref.get("kind") != MEDIA_REF_KIND
+        ):
+            raise _provider_error(
+                "managed_media_ref_key",
+                "source_not_found",
+                "本地媒体引用无效",
+            )
+        try:
+            return "/".join(_relative_parts(media_ref.get("relative_path")))
+        except ValueError as exc:
+            raise _provider_error(
+                "managed_media_ref_key",
+                "source_not_found",
+                "本地媒体引用无效",
+            ) from exc
+
     @staticmethod
     def _manual_source_ref(relative_path: str) -> JsonObject:
         return {

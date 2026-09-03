@@ -9,8 +9,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-import sakuramedia_local_provider.storage as storage_module
-from sakuramedia_local_provider.storage import LocalStorageProvider
 from src.plugins.provider_protocol import (
     ImportPlacement,
     LibraryHandle,
@@ -19,6 +17,9 @@ from src.plugins.provider_protocol import (
     ProviderOperationError,
 )
 from starlette.requests import Request
+
+import sakuramedia_local_provider.storage as storage_module
+from sakuramedia_local_provider.storage import LocalStorageProvider
 
 
 async def _response_body(response) -> bytes:
@@ -89,6 +90,44 @@ def test_browse_scan_refs_are_relative_and_symlinks_are_ignored(tmp_path: Path) 
         "kind": "manual_local_path",
         "relative_path": "nested/clip.mp4",
     }
+
+
+def test_scan_managed_media_ref_keys_lists_regular_files_and_ignores_symlinks(
+    tmp_path: Path,
+) -> None:
+    provider, _library, media_root, _import_root = _provider(tmp_path)
+    nested = media_root / "jav" / "ABC-001"
+    nested.mkdir(parents=True)
+    (nested / "movie.mp4").write_bytes(b"movie")
+    (media_root / "notes.txt").write_text("notes", encoding="utf-8")
+    outside = tmp_path / "outside.mp4"
+    outside.write_bytes(b"outside")
+    outside_dir = tmp_path / "outside-dir"
+    outside_dir.mkdir()
+    (outside_dir / "hidden.mp4").write_bytes(b"hidden")
+    try:
+        (media_root / "linked.mp4").symlink_to(outside)
+        (media_root / "linked-dir").symlink_to(outside_dir, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlink creation is unavailable")
+
+    keys = provider.scan_managed_media_ref_keys()
+
+    assert keys == {"jav/ABC-001/movie.mp4", "notes.txt"}
+
+
+def test_managed_media_ref_key_uses_relative_path(tmp_path: Path) -> None:
+    provider, _library, _media_root, _import_root = _provider(tmp_path)
+
+    key = provider.managed_media_ref_key(
+        media_ref={
+            "version": 1,
+            "kind": "media_local_path",
+            "relative_path": "nested/movie.mp4",
+        }
+    )
+
+    assert key == "nested/movie.mp4"
 
 
 def test_import_source_identity_tracks_source_content_and_location(
