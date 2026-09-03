@@ -103,6 +103,34 @@ def _provider_error(
     )
 
 
+def _staged_media(
+    *,
+    storage_ref: JsonObject,
+    receipt: JsonObject,
+    size_bytes: int,
+    duration_seconds: int | None,
+    video_info: JsonObject | None,
+    resolution: str | None,
+) -> StagedMedia:
+    """Build a staged result for both pre- and post-resolution v4 hosts."""
+    if "resolution" in getattr(StagedMedia, "__dataclass_fields__", {}):
+        return StagedMedia(
+            storage_ref=storage_ref,
+            receipt=receipt,
+            size_bytes=size_bytes,
+            duration_seconds=duration_seconds,
+            video_info=video_info,
+            resolution=resolution,
+        )
+    return StagedMedia(
+        storage_ref=storage_ref,
+        receipt=receipt,
+        size_bytes=size_bytes,
+        duration_seconds=duration_seconds,
+        video_info=video_info,
+    )
+
+
 def _is_video(name: str) -> bool:
     return Path(name).suffix.lower() in _VIDEO_SUFFIXES
 
@@ -718,7 +746,9 @@ class LocalStorageProvider:
         except (TypeError, ValueError) as exc:
             raise _provider_error("stage_import_file", "invalid_config", "导入操作标识无效") from exc
         source_path, source_relative, source_identity = self._source_for(source)
-        duration_seconds = self._probe_file_duration_seconds(source_path)
+        metadata = MediaMetadataProbeService.probe_file(source_path)
+        duration_seconds = max(0, int(metadata.duration_seconds or 0))
+        resolution = getattr(metadata, "resolution", None)
         if source_disposition == "delete_after_commit":
             self._reject_media_library_source(source_path, operation="stage_import_file")
         try:
@@ -748,12 +778,13 @@ class LocalStorageProvider:
                     raise _provider_error("stage_import_file", "invalid_config", "导入操作已终止")
                 if existing is not None:
                     self._target_is_complete(target, existing, operation="stage_import_file")
-                    return StagedMedia(
+                    return _staged_media(
                         storage_ref=self._media_ref(target_relative),
                         receipt={"operation_key": operation_name, "token": existing["token"]},
                         size_bytes=existing["target_size"],
                         duration_seconds=duration_seconds,
                         video_info=None,
+                        resolution=resolution,
                     )
             if target.exists() or target.is_symlink():
                 raise _provider_error("stage_import_file", "invalid_config", "导入目标已存在")
@@ -832,12 +863,13 @@ class LocalStorageProvider:
                 "stage_import_file", "unavailable", "本地媒体写入失败", retryable=True
             ) from exc
         receipt: JsonObject = {"operation_key": operation_name, "token": token}
-        return StagedMedia(
+        return _staged_media(
             storage_ref=self._media_ref(target_relative),
             receipt=receipt,
             size_bytes=journal["target_size"],
             duration_seconds=duration_seconds,
             video_info=None,
+            resolution=resolution,
         )
 
     def finalize_import(self, *, receipt: JsonObject) -> None:
@@ -928,6 +960,11 @@ class LocalStorageProvider:
         return max(0, int(MediaMetadataProbeService.probe_file(path).duration_seconds or 0))
 
     @staticmethod
+    def _probe_file_resolution(path: Path) -> str | None:
+        resolution = getattr(MediaMetadataProbeService.probe_file(path), "resolution", None)
+        return resolution if isinstance(resolution, str) else None
+
+    @staticmethod
     def _lower_process_priority() -> None:
         try:
             os.nice(19)
@@ -937,6 +974,11 @@ class LocalStorageProvider:
     def probe_duration_seconds(self, *, media: MediaHandle) -> int:
         return self._probe_file_duration_seconds(
             self._media_path(media, operation="probe_duration_seconds")
+        )
+
+    def probe_resolution(self, *, media: MediaHandle) -> str | None:
+        return self._probe_file_resolution(
+            self._media_path(media, operation="probe_resolution")
         )
 
     def open_cover_source(self, *, media: MediaHandle) -> BinaryIO:

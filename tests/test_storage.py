@@ -4,6 +4,7 @@ import asyncio
 import os
 import sys
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -128,7 +129,7 @@ def test_stage_is_idempotent_and_layout_has_operation_version(
     monkeypatch.setattr(
         storage_module.MediaMetadataProbeService,
         "probe_file",
-        lambda _path: SimpleNamespace(duration_seconds=42),
+        lambda _path: SimpleNamespace(duration_seconds=42, resolution="720x1280"),
     )
     provider, library, media_root, import_root = _provider(tmp_path)
     source_path = import_root / "ABC-001.mp4"
@@ -154,6 +155,8 @@ def test_stage_is_idempotent_and_layout_has_operation_version(
     assert first.receipt == second.receipt
     assert first.duration_seconds == 42
     assert second.duration_seconds == 42
+    assert first.resolution == "720x1280"
+    assert second.resolution == "720x1280"
     target = media_root / "jav/ABC-001/import-1/ABC-001.mp4"
     assert target.read_bytes() == b"source"
     assert os.stat(target).st_ino == os.stat(source_path).st_ino
@@ -169,9 +172,53 @@ def test_stage_is_idempotent_and_layout_has_operation_version(
     assert provider.probe_duration_seconds(
         media=_media(library, first.storage_ref["relative_path"])
     ) == 42
+    assert provider.probe_resolution(
+        media=_media(library, first.storage_ref["relative_path"])
+    ) == "720x1280"
     provider.delete_media(media=_media(library, first.storage_ref["relative_path"]))
     assert not target.exists()
     provider.delete_media(media=_media(library, first.storage_ref["relative_path"]))
+
+
+def test_stage_supports_legacy_staged_media_contract(tmp_path: Path, monkeypatch) -> None:
+    @dataclass
+    class LegacyStagedMedia:
+        storage_ref: dict
+        receipt: dict
+        size_bytes: int
+        duration_seconds: int | None
+        video_info: dict | None
+
+    monkeypatch.setattr(storage_module, "StagedMedia", LegacyStagedMedia)
+    monkeypatch.setattr(
+        storage_module.MediaMetadataProbeService,
+        "probe_file",
+        lambda _path: SimpleNamespace(duration_seconds=42, resolution="720x1280"),
+    )
+    provider, _library, _media_root, import_root = _provider(tmp_path)
+    (import_root / "clip.mp4").write_bytes(b"source")
+    source = provider.scan_import_source(
+        source_ref={"version": 1, "kind": "manual_local_path", "relative_path": ""}
+    )[0]
+    placement = ImportPlacement(relative_path="jav/ABC-001/clip.mp4")
+
+    first = provider.stage_import_file(
+        source=source,
+        placement=placement,
+        source_disposition="keep",
+        operation_key="legacy-import",
+    )
+    second = provider.stage_import_file(
+        source=source,
+        placement=placement,
+        source_disposition="keep",
+        operation_key="legacy-import",
+    )
+
+    assert isinstance(first, LegacyStagedMedia)
+    assert isinstance(second, LegacyStagedMedia)
+    assert first.duration_seconds == second.duration_seconds == 42
+    assert not hasattr(first, "resolution")
 
 
 def test_delete_after_commit_copies_then_only_deletes_source(tmp_path: Path) -> None:
