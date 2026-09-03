@@ -296,6 +296,7 @@ def test_submit_torrent_downloads_url_and_submits_bytes(monkeypatch: pytest.Monk
 
     class Response:
         status_code = 200
+        is_redirect = False
         headers: ClassVar[dict[str, str]] = {"content-length": "13"}
 
         def iter_bytes(self):
@@ -313,7 +314,7 @@ def test_submit_torrent_downloads_url_and_submits_bytes(monkeypatch: pytest.Monk
 
     class HTTPClient:
         def __init__(self, **kwargs: object) -> None:
-            assert kwargs == {"timeout": 120.0, "follow_redirects": True, "trust_env": False}
+            assert kwargs == {"timeout": 120.0, "follow_redirects": False, "trust_env": False}
 
         def __enter__(self) -> Self:
             return self
@@ -340,6 +341,60 @@ def test_submit_torrent_downloads_url_and_submits_bytes(monkeypatch: pytest.Monk
     assert task.remote_id == HASH
     assert fake.add_calls[0]["torrent_files"] == b"torrent-bytes"
     assert "urls" not in fake.add_calls[0]
+
+
+def test_submit_torrent_redirected_to_magnet_submits_magnet(
+    monkeypatch: pytest.MonkeyPatch, provider
+) -> None:
+    client, fake = provider
+    magnet = f"magnet:?xt=urn:btih:{HASH}"
+
+    class Response:
+        def __init__(self, url: str) -> None:
+            self.is_redirect = True
+            self.status_code = 302
+            self.headers = {"location": magnet}
+            assert url == "https://index.example/ABC.torrent"
+
+        def iter_bytes(self):
+            raise AssertionError("redirect response must not be read as a torrent")
+
+    class Stream:
+        def __init__(self, url: str) -> None:
+            self.response = Response(url)
+
+        def __enter__(self) -> Response:
+            return self.response
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    class HTTPClient:
+        def __init__(self, **kwargs: object) -> None:
+            assert kwargs == {"timeout": 120.0, "follow_redirects": False, "trust_env": False}
+
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def stream(self, method: str, url: str) -> Stream:
+            assert method == "GET"
+            return Stream(url)
+
+    monkeypatch.setattr(qbittorrent.httpx, "Client", HTTPClient)
+
+    task = client.submit(
+        submission=DownloadSubmission(
+            source_uri="https://index.example/ABC.torrent",
+            display_name="ABC 001",
+        )
+    )
+
+    assert task.remote_id == HASH
+    assert fake.add_calls[0]["urls"] == magnet
+    assert "torrent_files" not in fake.add_calls[0]
 
 
 def test_submit_existing_torrent_returns_actual_managed_task_without_tagging(provider) -> None:

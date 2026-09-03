@@ -19,7 +19,7 @@ import time
 from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
-from urllib.parse import unquote, urlsplit
+from urllib.parse import unquote, urljoin, urlsplit
 
 import httpx
 
@@ -42,6 +42,7 @@ CLIENT_TAG_PREFIX = "client:"
 LOCAL_REF_VERSION = 1
 LOCAL_REF_KIND = "download_local_path"
 MAX_TORRENT_BYTES = 16 * 1024 * 1024
+MAX_HTTP_REDIRECTS = 5
 DEAD_TORRENT_IDLE_SECONDS = 24 * 60 * 60
 _BTIH_RE = re.compile(r"urn:btih:([A-Za-z0-9]+)", re.IGNORECASE)
 _ALLOWED_CONFIG_KEYS = frozenset(
@@ -802,55 +803,69 @@ class QbittorrentDownloadProvider:
             raise ValueError("invalid torrent file") from exc
 
     @staticmethod
-    def _download_torrent(url: str) -> bytes:
+    def _resolve_http_source(url: str) -> tuple[Literal["magnet", "torrent"], str | bytes]:
         parsed = urlsplit(url)
         if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
             raise ValueError("invalid torrent url")
         try:
-            with (
-                httpx.Client(timeout=120.0, follow_redirects=True, trust_env=False) as http_client,
-                http_client.stream("GET", url) as response,
-            ):
-                status = int(response.status_code)
-                if status == 404:
-                    raise _error("submit", "source_not_found", "种子文件不存在")
-                if 400 <= status < 500:
-                    raise _error("submit", "unsupported", "种子文件地址不受支持")
-                if status >= 500:
-                    raise _error(
-                        "submit", "unavailable", "种子文件服务暂时不可用", retryable=True
-                    )
-                if not 200 <= status < 300:
-                    raise _error("submit", "unsupported", "种子文件地址不受支持")
-                content_length = response.headers.get("content-length")
-                if content_length is not None:
-                    try:
-                        if int(content_length) > MAX_TORRENT_BYTES:
-                            raise _error("submit", "unsupported", "种子文件超过大小限制")
-                    except ValueError:
-                        raise _error("submit", "unsupported", "种子文件响应无效") from None
-                chunks: list[bytes] = []
-                total = 0
-                for chunk in response.iter_bytes():
-                    total += len(chunk)
-                    if total > MAX_TORRENT_BYTES:
-                        raise _error("submit", "unsupported", "种子文件超过大小限制")
-                    chunks.append(chunk)
-                return b"".join(chunks)
+            with httpx.Client(timeout=120.0, follow_redirects=False, trust_env=False) as http_client:
+                request_url = url
+                for _ in range(MAX_HTTP_REDIRECTS):
+                    with http_client.stream("GET", request_url) as response:
+                        if response.is_redirect:
+                            location = response.headers.get("location")
+                            if not location:
+                                raise _error("submit", "unsupported", "种子文件重定向地址无效")
+                            request_url = urljoin(request_url, location)
+                            if _is_magnet(request_url):
+                                return "magnet", request_url
+                            parsed = urlsplit(request_url)
+                            if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+                                raise _error("submit", "unsupported", "种子文件重定向地址不受支持")
+                            continue
+                        status = int(response.status_code)
+                        if status == 404:
+                            raise _error("submit", "source_not_found", "种子文件不存在")
+                        if 400 <= status < 500:
+                            raise _error("submit", "unsupported", "种子文件地址不受支持")
+                        if status >= 500:
+                            raise _error(
+                                "submit", "unavailable", "种子文件服务暂时不可用", retryable=True
+                            )
+                        if not 200 <= status < 300:
+                            raise _error("submit", "unsupported", "种子文件地址不受支持")
+                        content_length = response.headers.get("content-length")
+                        if content_length is not None:
+                            try:
+                                if int(content_length) > MAX_TORRENT_BYTES:
+                                    raise _error("submit", "unsupported", "种子文件超过大小限制")
+                            except ValueError:
+                                raise _error("submit", "unsupported", "种子文件响应无效") from None
+                        chunks: list[bytes] = []
+                        total = 0
+                        for chunk in response.iter_bytes():
+                            total += len(chunk)
+                            if total > MAX_TORRENT_BYTES:
+                                raise _error("submit", "unsupported", "种子文件超过大小限制")
+                            chunks.append(chunk)
+                        return "torrent", b"".join(chunks)
+                raise _error("submit", "unsupported", "种子文件重定向次数过多")
         except ProviderOperationError:
             raise
         except (httpx.HTTPError, OSError) as exc:
             raise _error("submit", "unavailable", "种子文件下载失败", retryable=True) from exc
 
-    def _source(self, source_uri: str) -> tuple[str, str, bytes | None]:
+    def _source(self, source_uri: str) -> tuple[str, Literal["magnet", "torrent"], str | bytes]:
         if _is_magnet(source_uri):
             try:
                 info_hash = parse_hash_from_magnet(source_uri)
             except ValueError as exc:
                 raise _error("submit", "invalid_config", "磁力链接无效") from exc
-            return info_hash, "magnet", None
+            return info_hash, "magnet", source_uri
         try:
-            payload = self._download_torrent(source_uri)
+            source_kind, payload = self._resolve_http_source(source_uri)
+            if source_kind == "magnet":
+                return parse_hash_from_magnet(payload), "magnet", payload
             return self._parse_torrent_hash(payload), "torrent", payload
         except ProviderOperationError:
             raise
@@ -877,7 +892,7 @@ class QbittorrentDownloadProvider:
                 raise ValueError("empty source")
         except (AttributeError, TypeError, ValueError) as exc:
             raise _error("submit", "invalid_config", "下载提交参数无效") from exc
-        info_hash, source_kind, torrent_payload = self._source(source_uri)
+        info_hash, source_kind, source_payload = self._source(source_uri)
         if info_hash in self._dead_hashes():
             logger.info(
                 "qB torrent submission rejected because the hash is blacklisted "
@@ -893,14 +908,14 @@ class QbittorrentDownloadProvider:
         try:
             if source_kind == "magnet":
                 response = self.client.torrents_add(
-                    urls=source_uri,
+                    urls=source_payload,
                     tags=tags,
                     save_path=save_path,
                     rename=display_name,
                 )
             else:
                 response = self.client.torrents_add(
-                    torrent_files=torrent_payload,
+                    torrent_files=source_payload,
                     tags=tags,
                     save_path=save_path,
                     rename=display_name,
