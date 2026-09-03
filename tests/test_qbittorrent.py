@@ -277,6 +277,20 @@ def test_submit_magnet_uses_managed_tags_and_safe_remote_path(provider) -> None:
     }
 
 
+def test_submit_magnet_sanitizes_path_unsafe_display_name(provider) -> None:
+    client, fake = provider
+
+    client.submit(
+        submission=DownloadSubmission(
+            source_uri=f"magnet:?xt=urn:btih:{HASH}",
+            display_name="ABC/foo\\remux",
+        )
+    )
+
+    assert fake.add_calls[0]["save_path"] == "/downloads/ABC foo remux"
+    assert fake.add_calls[0]["rename"] == "ABC foo remux"
+
+
 def test_submit_torrent_downloads_url_and_submits_bytes(monkeypatch: pytest.MonkeyPatch, provider) -> None:
     client, fake = provider
 

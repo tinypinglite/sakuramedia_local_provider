@@ -147,8 +147,8 @@ def _is_magnet(value: str) -> bool:
 def _safe_display_name(value: object) -> str:
     if not isinstance(value, str):
         raise TypeError("invalid display name")
-    name = value.strip()
-    if not name or name in {".", ".."} or any(char in name for char in "/\\\x00"):
+    name = " ".join(value.replace("\x00", " ").replace("/", " ").replace("\\", " ").split())
+    if not name or name in {".", ".."}:
         raise ValueError("invalid display name")
     return name
 
