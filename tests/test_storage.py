@@ -547,6 +547,35 @@ def test_merged_playback_uses_ordered_local_media_and_range_response(
     assert seen["thread_id"] != threading.get_ident()
 
 
+def test_merged_playback_preflight_rejects_unsupported_layout(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    provider, library, media_root, _import_root = _provider(tmp_path)
+    first_path = media_root / "videos/part-1.mp4"
+    second_path = media_root / "videos/part-2.mp4"
+    first_path.parent.mkdir(parents=True)
+    first_path.write_bytes(b"first")
+    second_path.write_bytes(b"second")
+
+    def reject_layout(_entries):
+        raise storage_module.Mp4MergeError("分段视频规格不一致，不支持合并播放")
+
+    monkeypatch.setattr(storage_module, "build_layout", reject_layout)
+
+    with pytest.raises(ProviderOperationError) as error:
+        provider.preflight_merged_playback(
+            medias=(
+                _media(library, "videos/part-1.mp4", media_id=1),
+                _media(library, "videos/part-2.mp4", media_id=2),
+            )
+        )
+
+    assert error.value.operation == "merged_playback"
+    assert error.value.code == "unsupported"
+    assert error.value.safe_message == "分段视频规格不一致，不支持合并播放"
+
+
 def test_compute_file_hash_matches_protocol_vector(tmp_path: Path) -> None:
     provider, library, media_root, _import_root = _provider(tmp_path)
     path = media_root / "videos/hash.bin"

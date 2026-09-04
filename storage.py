@@ -1425,6 +1425,23 @@ class LocalStorageProvider:
             headers=headers,
         )
 
+    def _build_merged_layout(self, *, medias: tuple[MediaHandle, ...]):
+        try:
+            entries = [
+                (media.media_id, self._media_path(media, operation="merged_playback"))
+                for media in medias
+            ]
+            return build_layout(entries)
+        except Mp4MergeError as exc:
+            raise _provider_error("merged_playback", "unsupported", exc.message) from exc
+        except OSError as exc:
+            raise _provider_error(
+                "merged_playback", "unavailable", "媒体文件读取失败", retryable=True
+            ) from exc
+
+    def preflight_merged_playback(self, *, medias: tuple[MediaHandle, ...]) -> None:
+        self._build_merged_layout(medias=medias)
+
     async def handle_merged_playback(
         self,
         *,
@@ -1433,18 +1450,7 @@ class LocalStorageProvider:
     ) -> Response:
         if context.resource_path != "stream.mp4":
             raise _provider_error("merged_playback", "source_not_found", "本地合并播放资源不存在")
-        try:
-            entries = [
-                (media.media_id, self._media_path(media, operation="merged_playback"))
-                for media in medias
-            ]
-            layout = await asyncio.to_thread(build_layout, entries)
-        except Mp4MergeError as exc:
-            raise _provider_error("merged_playback", "unsupported", exc.message) from exc
-        except OSError as exc:
-            raise _provider_error(
-                "merged_playback", "unavailable", "媒体文件读取失败", retryable=True
-            ) from exc
+        layout = await asyncio.to_thread(self._build_merged_layout, medias=medias)
         return merged_range_requests_response(context.request, layout, "video/mp4")
 
     def generate_thumbnails(self, *, media: MediaHandle, workspace: Path) -> ThumbnailGeneration:
