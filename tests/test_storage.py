@@ -9,6 +9,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import sakuramedia_local_provider.storage as storage_module
+from sakuramedia_local_provider.storage import LocalStorageProvider
+from starlette.requests import Request
+
 from src.plugins.provider_protocol import (
     ImportPlacement,
     LibraryHandle,
@@ -16,10 +20,6 @@ from src.plugins.provider_protocol import (
     PlaybackContext,
     ProviderOperationError,
 )
-from starlette.requests import Request
-
-import sakuramedia_local_provider.storage as storage_module
-from sakuramedia_local_provider.storage import LocalStorageProvider
 
 
 async def _response_body(response) -> bytes:
@@ -128,6 +128,104 @@ def test_managed_media_ref_key_uses_relative_path(tmp_path: Path) -> None:
     )
 
     assert key == "nested/movie.mp4"
+
+
+def test_open_transfer_source_exposes_independent_pathless_seekable_readers(tmp_path: Path) -> None:
+    provider, library, media_root, _import_root = _provider(tmp_path)
+    path = media_root / "nested" / "movie.mp4"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"0123456789")
+
+    with provider.open_transfer_source(
+        media=_media(library, "nested/movie.mp4", file_size_bytes=10)
+    ) as source:
+        assert source.info.file_name == "movie.mp4"
+        assert source.info.size_bytes == 10
+        with source.open_reader() as first, source.open_reader() as second:
+            assert not hasattr(first, "name")
+            assert not hasattr(first, "fileno")
+            assert not hasattr(first, "close")
+            assert first.read(3) == b"012"
+            assert second.read(2) == b"01"
+            assert first.seek(7) == 7
+            assert first.seek(0, 1) == 7
+            assert first.read() == b"789"
+            assert second.read() == b"23456789"
+        source.assert_unchanged()
+
+
+def test_open_transfer_source_keeps_original_inode_but_rejects_path_replacement(
+    tmp_path: Path,
+) -> None:
+    provider, library, media_root, _import_root = _provider(tmp_path)
+    path = media_root / "movie.mp4"
+    path.write_bytes(b"original")
+    replacement = media_root / "replacement.mp4"
+    replacement.write_bytes(b"new-file")
+
+    with provider.open_transfer_source(
+        media=_media(library, "movie.mp4", file_size_bytes=8)
+    ) as source:
+        replacement.replace(path)
+        with source.open_reader() as reader:
+            assert reader.read() == b"original"
+        with pytest.raises(ProviderOperationError) as error:
+            source.assert_unchanged()
+
+    assert error.value.operation == "open_transfer_source"
+    assert error.value.code == "source_not_found"
+    assert error.value.safe_message == "媒体文件已变化"
+
+
+def test_open_transfer_source_rejects_in_place_file_changes(tmp_path: Path) -> None:
+    provider, library, media_root, _import_root = _provider(tmp_path)
+    path = media_root / "movie.mp4"
+    path.write_bytes(b"original")
+
+    with provider.open_transfer_source(
+        media=_media(library, "movie.mp4", file_size_bytes=8)
+    ) as source:
+        path.write_bytes(b"changed!")
+        with pytest.raises(ProviderOperationError) as error:
+            source.assert_unchanged()
+
+    assert error.value.operation == "open_transfer_source"
+    assert error.value.code == "source_not_found"
+
+
+def test_open_transfer_source_rejects_stale_media_size(tmp_path: Path) -> None:
+    provider, library, media_root, _import_root = _provider(tmp_path)
+    (media_root / "movie.mp4").write_bytes(b"content")
+
+    with (
+        pytest.raises(ProviderOperationError) as error,
+        provider.open_transfer_source(
+            media=_media(library, "movie.mp4", file_size_bytes=99)
+        ),
+    ):
+        pass
+
+    assert error.value.operation == "open_transfer_source"
+    assert error.value.code == "source_not_found"
+
+
+def test_open_transfer_source_rejects_symlink_media_ref(tmp_path: Path) -> None:
+    provider, library, media_root, _import_root = _provider(tmp_path)
+    outside = tmp_path / "outside.mp4"
+    outside.write_bytes(b"outside")
+    try:
+        (media_root / "linked.mp4").symlink_to(outside)
+    except OSError:
+        pytest.skip("symlink creation is unavailable")
+
+    with (
+        pytest.raises(ProviderOperationError) as error,
+        provider.open_transfer_source(media=_media(library, "linked.mp4")),
+    ):
+        pass
+
+    assert error.value.operation == "open_transfer_source"
+    assert error.value.code == "source_not_found"
 
 
 def test_import_source_identity_tracks_source_content_and_location(
@@ -911,3 +1009,43 @@ def test_scan_recognises_video_suffixes(tmp_path: Path, suffix: str) -> None:
     )
     assert len(files) == 1
     assert files[0].is_video is True
+
+
+@pytest.mark.parametrize("change", ["none", "replace", "remove", "symlink", "close", "wrong_media", "wrong_owner"])
+def test_transfer_cleanup_only_removes_the_same_open_source(tmp_path, change):
+    from dataclasses import replace
+    provider, library, root, _ = _provider(tmp_path)
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / "video.mp4"
+    path.write_bytes(b"test-bytes")
+    media = _media(library, "video.mp4")
+    media = replace(media, file_size_bytes=10)
+    download = tmp_path / "download.mp4"
+    import os
+    os.link(path, download)
+    with provider.open_transfer_source(media=media) as source:
+        cleanup_media, cleanup_provider = media, provider
+        if change == "replace":
+            path.unlink()
+            path.write_bytes(b"replacement")
+        elif change == "remove":
+            path.unlink()
+        elif change == "symlink":
+            path.unlink()
+            path.symlink_to(download)
+        elif change == "close":
+            source._close()
+        elif change == "wrong_media":
+            cleanup_media = replace(media, media_id=media.media_id + 1)
+        elif change == "wrong_owner":
+            cleanup_provider = LocalStorageProvider(library=library, data_dir=tmp_path / "other-data")
+        if change == "none":
+            cleanup_provider.cleanup_transfer_source(media=cleanup_media, source=source)
+            assert not path.exists()
+        else:
+            with pytest.raises(ProviderOperationError):
+                cleanup_provider.cleanup_transfer_source(media=cleanup_media, source=source)
+            if change != "remove":
+                assert path.exists()
+    assert download.read_bytes() == b"test-bytes"
+    assert root.is_dir()

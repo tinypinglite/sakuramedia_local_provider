@@ -11,11 +11,16 @@ import os
 import re
 import secrets
 import shutil
+import stat
 import subprocess
 import tempfile
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, BinaryIO, Literal
+
+from starlette.responses import Response, StreamingResponse
 
 from src.plugins.provider_protocol import (
     BrowseEntry,
@@ -27,6 +32,8 @@ from src.plugins.provider_protocol import (
     JsonObject,
     LibraryHandle,
     MediaHandle,
+    MediaTransferSource,
+    MediaTransferSourceInfo,
     PlaybackContext,
     ProviderOperationError,
     StagedMedia,
@@ -34,7 +41,6 @@ from src.plugins.provider_protocol import (
     ThumbnailGeneration,
 )
 from src.service.playback.media_metadata_probe_service import MediaMetadataProbeService
-from starlette.responses import Response, StreamingResponse
 
 from .merged_playback import Mp4MergeError, build_layout, merged_range_requests_response
 
@@ -129,6 +135,137 @@ def _staged_media(
         duration_seconds=duration_seconds,
         video_info=video_info,
     )
+
+
+@dataclass(frozen=True)
+class _TransferFileSnapshot:
+    dev: int
+    ino: int
+    size: int
+    mtime_ns: int
+
+    @classmethod
+    def from_stat(cls, value: os.stat_result) -> _TransferFileSnapshot:
+        return cls(
+            dev=int(value.st_dev),
+            ino=int(value.st_ino),
+            size=int(value.st_size),
+            mtime_ns=int(value.st_mtime_ns),
+        )
+
+
+class _LocalTransferReader:
+    """Independent logical cursor over a source-owned stable file descriptor."""
+
+    def __init__(self, source: _LocalTransferSource) -> None:
+        self._source = source
+        self._position = 0
+        self._closed = False
+
+    def _close(self) -> None:
+        self._closed = True
+
+    def read(self, size: int = -1) -> bytes:
+        self._ensure_open()
+        if isinstance(size, bool) or not isinstance(size, int):
+            raise TypeError("read size must be an integer")
+        remaining = self._source.info.size_bytes - self._position
+        if size < 0:
+            size = max(0, remaining)
+        else:
+            size = min(size, max(0, remaining))
+        if size == 0:
+            return b""
+        try:
+            data = os.pread(self._source._fd, size, self._position)
+        except OSError as exc:
+            raise _provider_error(
+                "open_transfer_source", "unavailable", "媒体文件读取失败", retryable=True
+            ) from exc
+        self._position += len(data)
+        return data
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        self._ensure_open()
+        if isinstance(offset, bool) or not isinstance(offset, int):
+            raise TypeError("seek offset must be an integer")
+        if whence == os.SEEK_SET:
+            position = offset
+        elif whence == os.SEEK_CUR:
+            position = self._position + offset
+        elif whence == os.SEEK_END:
+            position = self._source.info.size_bytes + offset
+        else:
+            raise ValueError("invalid seek whence")
+        if position < 0:
+            raise ValueError("negative seek position")
+        self._position = position
+        return position
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise ValueError("I/O operation on closed transfer reader")
+        self._source._ensure_open()
+
+
+class _LocalTransferSource:
+    """Provider-private stable descriptor and the path snapshot it represents."""
+
+    def __init__(self, *, owner: object, media: MediaHandle, path: Path, fd: int, snapshot: _TransferFileSnapshot) -> None:
+        self._owner = owner
+        self._media = media
+        self._path = path
+        self._fd = fd
+        self._snapshot = snapshot
+        self.info = MediaTransferSourceInfo(file_name=path.name, size_bytes=snapshot.size)
+        self._closed = False
+
+    @contextmanager
+    def open_reader(self):
+        self._ensure_open()
+        reader = _LocalTransferReader(self)
+        try:
+            yield reader
+        finally:
+            reader._close()
+
+    def assert_unchanged(self) -> None:
+        self._ensure_open()
+        try:
+            descriptor = os.fstat(self._fd)
+        except OSError as exc:
+            raise _provider_error(
+                "open_transfer_source", "unavailable", "媒体文件读取失败", retryable=True
+            ) from exc
+        if not stat.S_ISREG(descriptor.st_mode) or (
+            _TransferFileSnapshot.from_stat(descriptor) != self._snapshot
+        ):
+            raise _provider_error("open_transfer_source", "source_not_found", "媒体文件已变化")
+        try:
+            current = os.stat(self._path, follow_symlinks=False)
+        except FileNotFoundError as exc:
+            raise _provider_error("open_transfer_source", "source_not_found", "媒体文件已变化") from exc
+        except OSError as exc:
+            raise _provider_error(
+                "open_transfer_source", "unavailable", "媒体文件读取失败", retryable=True
+            ) from exc
+        if not stat.S_ISREG(current.st_mode) or (
+            _TransferFileSnapshot.from_stat(current) != self._snapshot
+        ):
+            raise _provider_error("open_transfer_source", "source_not_found", "媒体文件已变化")
+
+    def _close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            os.close(self._fd)
+        except OSError:
+            pass
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise ValueError("I/O operation on closed transfer source")
 
 
 def _is_video(name: str) -> bool:
@@ -1008,6 +1145,79 @@ class LocalStorageProvider:
         )
         return path
 
+    @contextmanager
+    def open_transfer_source(self, *, media: MediaHandle):
+        """Open one managed file as a stable, path-free transfer source.
+
+        The descriptor is opened only once. Readers use ``pread`` with their
+        own cursor, so independent range readers neither reveal nor share a
+        filesystem path or descriptor offset.
+        """
+        path = self._media_path(media, operation="open_transfer_source")
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(path, flags)
+        except FileNotFoundError as exc:
+            raise _provider_error("open_transfer_source", "source_not_found", "媒体文件不存在") from exc
+        except OSError as exc:
+            raise _provider_error(
+                "open_transfer_source", "unavailable", "媒体文件读取失败", retryable=True
+            ) from exc
+        try:
+            descriptor = os.fstat(fd)
+            if not stat.S_ISREG(descriptor.st_mode):
+                raise ValueError("media is not a regular file")
+            snapshot = _TransferFileSnapshot.from_stat(descriptor)
+            if snapshot.size != media.file_size_bytes:
+                raise ValueError("media size changed")
+            source = _LocalTransferSource(
+                owner=self, media=media, path=path,
+                fd=fd,
+                snapshot=snapshot,
+            )
+        except ValueError as exc:
+            os.close(fd)
+            raise _provider_error("open_transfer_source", "source_not_found", "媒体文件不可读取") from exc
+        except OSError as exc:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise _provider_error(
+                "open_transfer_source", "unavailable", "媒体文件读取失败", retryable=True
+            ) from exc
+
+        try:
+            yield source
+        finally:
+            source._close()
+
+    def cleanup_transfer_source(
+        self, *, media: MediaHandle, source: MediaTransferSource
+    ) -> None:
+        operation = "cleanup_transfer_source"
+        if (
+            not isinstance(source, _LocalTransferSource)
+            or source._owner is not self
+            or source._media != media
+        ):
+            raise _provider_error(operation, "invalid_config", "源会话与媒体不匹配")
+        try:
+            source._ensure_open()
+            path = self._media_path(media, operation=operation)
+            if path != source._path:
+                raise ValueError("source path changed")
+            source.assert_unchanged()
+            path.unlink()
+        except (ValueError, OSError):
+            raise _provider_error(
+                operation, "unavailable", "源文件清理未完成"
+            ) from None
+        except ProviderOperationError:
+            raise _provider_error(
+                operation, "unavailable", "源文件身份无法确认，未完成清理"
+            ) from None
+
     @staticmethod
     def _probe_file_duration_seconds(path: Path) -> int:
         return max(0, int(MediaMetadataProbeService.probe_file(path).duration_seconds or 0))
@@ -1329,7 +1539,7 @@ class LocalStorageProvider:
                             media.media_id,
                             offset,
                         )
-                    except Exception as exc:  # noqa: BLE001 - keep old per-offset recovery
+                    except Exception as exc:
                         logger.warning(
                             "Local thumbnail frame failed media_id=%s offset_seconds=%s detail=%s",
                             media.media_id,

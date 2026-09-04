@@ -1,8 +1,8 @@
 {
   "plugin_id": "sakuramedia_local_provider",
   "display_name": "本地存储与 qBittorrent",
-  "version": "0.1.12",
-  "host_api_version": 4,
+  "version": "0.2.0",
+  "host_api_version": 5,
   "requires_python": ">=3.10,<3.11",
   "dependencies": [
     "qbittorrent-api>=2026.8.1",
