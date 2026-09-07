@@ -46,6 +46,15 @@ LIBRARY_CONFIG_FIELDS = (
         description="手动浏览和导入本地文件时使用的目录；用于导入已有媒体。",
         hint="/mnt",
     ),
+    ConfigField(
+        key="filename_blacklist",
+        label="文件名黑名单",
+        input="text",
+        required=False,
+        description="每行一个关键字；文件名包含关键字时不会导入，匹配不区分大小写。",
+        multiline=True,
+        hint="sample\ntrailer",
+    ),
 )
 
 
@@ -57,6 +66,14 @@ def _normalise_path(value: object) -> str:
         path = Path.cwd() / path
     _reject_symlink_components(path)
     return str(path.resolve(strict=False))
+
+
+def _normalise_filename_blacklist(value: object) -> str:
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ValueError("invalid filename blacklist")
+    return "\n".join(line.strip() for line in value.splitlines() if line.strip())
 
 
 class LocalMediaProviderBundle:
@@ -84,7 +101,9 @@ class LocalMediaProviderBundle:
                 safe_message="本地存储配置无效",
                 retryable=False,
             )
-        if set(submitted_config) != {"media_root_path", "manual_import_root_path"}:
+        required_fields = {"media_root_path", "manual_import_root_path"}
+        allowed_fields = required_fields | {"filename_blacklist"}
+        if not required_fields <= set(submitted_config) or not set(submitted_config) <= allowed_fields:
             raise ProviderOperationError(
                 provider_key=self.provider_key,
                 operation="prepare_library",
@@ -97,6 +116,9 @@ class LocalMediaProviderBundle:
                 "media_root_path": _normalise_path(submitted_config["media_root_path"]),
                 "manual_import_root_path": _normalise_path(
                     submitted_config["manual_import_root_path"]
+                ),
+                "filename_blacklist": _normalise_filename_blacklist(
+                    submitted_config.get("filename_blacklist")
                 ),
             }
         except (OSError, ValueError) as exc:

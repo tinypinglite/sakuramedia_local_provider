@@ -13,6 +13,7 @@
 - 名称：媒体库在 SakuraMedia 中的显示名称。
 - 媒体库路径：影片导入后的最终目录，填写已挂载到 SakuraMedia 容器内的路径，例如 `/mnt/sakuramedia-media`。
 - 手动导入根目录：浏览并导入已有本地文件的目录，填写已挂载到 SakuraMedia 容器内的路径，例如 `/mnt/sakuramedia-import`。
+- 文件名黑名单：可选，每行一个关键字。文件名包含任一关键字的文件不会导入，匹配不区分大小写，例如 `sample` 或 `trailer`。
 
 这里填写的是 SakuraMedia 容器内的挂载路径，不是宿主机路径。编辑已有媒体库时不能改存储 Provider；需要换 Provider 时，请新建媒体库后再迁移。
 

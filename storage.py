@@ -272,6 +272,16 @@ def _is_video(name: str) -> bool:
     return Path(name).suffix.lower() in _VIDEO_SUFFIXES
 
 
+def _filename_blacklist(value: object) -> tuple[str, ...]:
+    if not isinstance(value, str):
+        return ()
+    return tuple(
+        entry.casefold()
+        for line in value.splitlines()
+        if (entry := line.strip())
+    )
+
+
 def _relative_parts(value: object, *, allow_empty: bool = False) -> tuple[str, ...]:
     if not isinstance(value, str) or "\x00" in value or "\\" in value:
         raise ValueError("unsafe relative path")
@@ -329,6 +339,7 @@ class LocalStorageProvider:
         try:
             self.media_root = _root_path(config.get("media_root_path"))
             self.manual_import_root = _root_path(config.get("manual_import_root_path"))
+            self.filename_blacklist = _filename_blacklist(config.get("filename_blacklist"))
             self.data_dir = _root_path(str(data_dir))
             self.operation_dir = self.data_dir / "operations"
             _reject_symlink_components(self.operation_dir, include_leaf=False)
@@ -550,6 +561,8 @@ class LocalStorageProvider:
         for candidate in candidates:
             try:
                 if candidate.is_symlink() or not candidate.is_file():
+                    continue
+                if any(entry in candidate.name.casefold() for entry in self.filename_blacklist):
                     continue
                 _reject_symlink_components(candidate)
                 resolved = candidate.resolve(strict=True)
