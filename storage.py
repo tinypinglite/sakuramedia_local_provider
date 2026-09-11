@@ -1004,7 +1004,7 @@ class LocalStorageProvider:
                         receipt={"operation_key": operation_name, "token": existing["token"]},
                         size_bytes=existing["target_size"],
                         duration_seconds=duration_seconds,
-                        video_info=None,
+                        video_info=metadata.video_info,
                         resolution=resolution,
                     )
             if target.exists() or target.is_symlink():
@@ -1089,7 +1089,7 @@ class LocalStorageProvider:
             receipt=receipt,
             size_bytes=journal["target_size"],
             duration_seconds=duration_seconds,
-            video_info=None,
+            video_info=metadata.video_info,
             resolution=resolution,
         )
 
@@ -1269,6 +1269,11 @@ class LocalStorageProvider:
         return self._probe_file_duration_seconds(
             self._media_path(media, operation="probe_duration_seconds")
         )
+
+    def probe_video_info(self, *, media: MediaHandle) -> JsonObject | None:
+        return MediaMetadataProbeService.probe_file(
+            self._media_path(media, operation="probe_video_info")
+        ).video_info
 
     def probe_resolution(self, *, media: MediaHandle) -> str | None:
         return self._probe_file_resolution(

@@ -19,7 +19,9 @@ from src.plugins.provider_protocol import (
     PreparedLibrary,
     ProviderOperationError,
 )
+from src.scheduler.contracts import JobDefinition
 
+from .cleanup import cleanup_empty_media_dirs
 from .qbittorrent import QbittorrentDownloadComponent
 from .storage import LocalStorageProvider, _reject_symlink_components
 
@@ -121,6 +123,16 @@ def register(context: PluginContext) -> PluginRegistration:
         display_name=DISPLAY_NAME,
         version=VERSION,
         host_api_version=HOST_API_VERSION,
+        jobs=(
+            JobDefinition(
+                task_key="sakuramedia_local_cleanup_empty_media_dirs",
+                log_name="local-cleanup-empty-media-dirs",
+                cli_name="local-cleanup-empty-media-dirs",
+                cli_help="清理本地媒体库空目录（请在无导入、转移任务时运行）",
+                manual_only=True,
+                handler=cleanup_empty_media_dirs,
+            ),
+        ),
         extensions=(
             PluginExtension(key=MEDIA_PROVIDER_EXTENSION_KEY, data=bundle),
         ),

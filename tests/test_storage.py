@@ -298,7 +298,7 @@ def test_stage_is_idempotent_and_layout_has_operation_version(
     monkeypatch.setattr(
         storage_module.MediaMetadataProbeService,
         "probe_file",
-        lambda _path: SimpleNamespace(duration_seconds=42, resolution="720x1280"),
+        lambda _path: SimpleNamespace(duration_seconds=42, resolution="720x1280", video_info={"video": {"codec_name": "h264"}}),
     )
     provider, library, media_root, import_root = _provider(tmp_path)
     source_path = import_root / "ABC-001.mp4"
@@ -326,6 +326,7 @@ def test_stage_is_idempotent_and_layout_has_operation_version(
     assert second.duration_seconds == 42
     assert first.resolution == "720x1280"
     assert second.resolution == "720x1280"
+    assert first.video_info == second.video_info == {"video": {"codec_name": "h264"}}
     target = media_root / "jav/ABC-001/import-1/ABC-001.mp4"
     assert target.read_bytes() == b"source"
     assert os.stat(target).st_ino == os.stat(source_path).st_ino
@@ -344,6 +345,9 @@ def test_stage_is_idempotent_and_layout_has_operation_version(
     assert provider.probe_resolution(
         media=_media(library, first.storage_ref["relative_path"])
     ) == "720x1280"
+    assert provider.probe_video_info(
+        media=_media(library, first.storage_ref["relative_path"])
+    ) == first.video_info
     provider.delete_media(media=_media(library, first.storage_ref["relative_path"]))
     assert not target.exists()
     provider.delete_media(media=_media(library, first.storage_ref["relative_path"]))
@@ -362,7 +366,7 @@ def test_stage_supports_legacy_staged_media_contract(tmp_path: Path, monkeypatch
     monkeypatch.setattr(
         storage_module.MediaMetadataProbeService,
         "probe_file",
-        lambda _path: SimpleNamespace(duration_seconds=42, resolution="720x1280"),
+        lambda _path: SimpleNamespace(duration_seconds=42, resolution="720x1280", video_info={"video": {"codec_name": "h264"}}),
     )
     provider, _library, _media_root, import_root = _provider(tmp_path)
     (import_root / "clip.mp4").write_bytes(b"source")

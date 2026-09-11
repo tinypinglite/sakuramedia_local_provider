@@ -4,7 +4,6 @@ import json
 from pathlib import Path
 
 from sakuramedia_local_provider.plugin import DISPLAY_NAME, PLUGIN_ID, register
-
 from src.plugins import PluginContext
 from src.plugins.provider_protocol import MEDIA_PROVIDER_EXTENSION_KEY
 
@@ -58,3 +57,17 @@ def test_registration_preserves_plugin_data_directory(tmp_path: Path) -> None:
     )
     bundle = registration.extensions[0].data
     assert bundle.data_dir == data_dir
+
+
+def test_empty_directory_cleanup_is_manual_and_has_no_parameters(tmp_path: Path) -> None:
+    from sakuramedia_local_provider.cleanup import cleanup_empty_media_dirs
+
+    registration = register(
+        PluginContext(plugin_id=PLUGIN_ID, settings={}, data_dir=tmp_path / 'data')
+    )
+    assert len(registration.jobs) == 1
+    job = registration.jobs[0]
+    assert job.task_key == 'sakuramedia_local_cleanup_empty_media_dirs'
+    assert job.manual_only and job.manual_trigger_allowed
+    assert job.params_schema is None
+    assert job.handler is cleanup_empty_media_dirs
