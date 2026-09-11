@@ -92,6 +92,38 @@ def test_browse_scan_refs_are_relative_and_symlinks_are_ignored(tmp_path: Path) 
     }
 
 
+@pytest.mark.parametrize("source_kind", ["empty", "directory", "file"])
+def test_scan_reports_stage_progress(tmp_path: Path, monkeypatch, caplog, source_kind: str) -> None:
+    provider, _library, _media_root, import_root = _provider(tmp_path)
+    relative_path = ""
+    expected_files = []
+    total = 0
+    if source_kind != "empty":
+        (import_root / "nested").mkdir()
+        (import_root / "nested" / "clip.mp4").write_bytes(b"video")
+        expected_files = ["nested/clip.mp4"]
+        total = 2
+        if source_kind == "file":
+            relative_path = "nested/clip.mp4"
+            total = 1
+    monkeypatch.setattr(storage_module.time, "monotonic", lambda: 0.0)
+    progress = []
+    with caplog.at_level("INFO"):
+        files = provider.scan_import_source(
+            source_ref={"version": 1, "kind": "manual_local_path", "relative_path": relative_path},
+            progress_callback=progress.append,
+        )
+    assert [item.relative_path for item in files] == expected_files
+    # Fast scans still emit stage boundaries, without per-entry updates.
+    assert [(item["current"], item["total"]) for item in progress] == [
+        (0, 0), (total, total), (0, total), (total, total),
+    ]
+    assert progress[0]["text"].startswith("枚举本地目录")
+    assert progress[2]["text"].startswith("检查本地文件")
+    assert f"发现 {len(expected_files)} 个文件" in progress[-1]["text"]
+    assert "本地扫描完成" in caplog.text
+
+
 def test_scan_managed_media_ref_keys_lists_regular_files_and_ignores_symlinks(
     tmp_path: Path,
 ) -> None:
@@ -687,9 +719,15 @@ def test_thumbnails_seek_each_offset_and_write_webp(
     monkeypatch.setitem(sys.modules, "av", fake_av)
     monkeypatch.setattr(storage_module.os, "nice", lambda _value: 0)
     workspace = tmp_path / "thumbs"
+    progress = []
     generation = provider.generate_thumbnails(
-        media=_media(library, "videos/clip.mp4", duration=20), workspace=workspace
+        media=_media(library, "videos/clip.mp4", duration=20), workspace=workspace,
+        progress_callback=progress.append,
     )
+    assert progress[0] == "正在打开本地视频"
+    assert [text for text in progress if "已生成" in text] == [
+        f"正在生成缩略图 · 已生成 {count}/3 张" for count in range(4)
+    ]
     assert generation.expected_count == 3
     assert [artifact.offset_seconds for artifact in generation.artifacts] == [0, 10, 20]
     assert container.seek_calls == [10, 20]
