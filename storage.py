@@ -40,6 +40,7 @@ from src.plugins.provider_protocol import (
     ProviderOperationError,
     ScanProgressCallback,
     StagedMedia,
+    StorageSpaceUsage,
     ThumbnailArtifact,
     ThumbnailGeneration,
 )
@@ -358,6 +359,20 @@ class LocalStorageProvider:
             "kind": MEDIA_REF_KIND,
             "relative_path": relative_path,
         }
+
+    def get_space_usage(self) -> StorageSpaceUsage:
+        try:
+            _reject_symlink_components(self.media_root)
+            usage = shutil.disk_usage(self.media_root)
+        except (OSError, ValueError) as exc:
+            raise _provider_error(
+                "get_space_usage", "unavailable", "本地存储空间读取失败", retryable=True
+            ) from exc
+        return StorageSpaceUsage(
+            total_bytes=usage.total,
+            used_bytes=usage.used,
+            free_bytes=usage.free,
+        )
 
     def scan_managed_media_ref_keys(self) -> set[str]:
         """Enumerate regular files below the configured media root for validity checks."""

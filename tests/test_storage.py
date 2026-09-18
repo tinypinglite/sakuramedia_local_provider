@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import sys
 import threading
 from dataclasses import dataclass
@@ -90,6 +91,28 @@ def test_browse_scan_refs_are_relative_and_symlinks_are_ignored(tmp_path: Path) 
         "kind": "manual_local_path",
         "relative_path": "nested/clip.mp4",
     }
+
+
+def test_space_usage_reports_disk_capacity(tmp_path: Path) -> None:
+    provider, _library, _media_root, _import_root = _provider(tmp_path)
+
+    usage = provider.get_space_usage()
+
+    assert usage.total_bytes is not None and usage.total_bytes > 0
+    assert usage.used_bytes is not None and usage.used_bytes >= 0
+    assert usage.free_bytes is not None and usage.free_bytes >= 0
+    assert usage.total_bytes >= usage.used_bytes
+
+
+def test_space_usage_reports_unavailable_when_root_is_missing(tmp_path: Path) -> None:
+    provider, _library, media_root, _import_root = _provider(tmp_path)
+    shutil.rmtree(media_root)
+
+    with pytest.raises(ProviderOperationError) as error:
+        provider.get_space_usage()
+
+    assert error.value.operation == "get_space_usage"
+    assert error.value.code == "unavailable"
 
 
 @pytest.mark.parametrize("source_kind", ["empty", "directory", "file"])
