@@ -8,14 +8,14 @@ from src.plugins import PluginContext
 from src.plugins.provider_protocol import MEDIA_PROVIDER_EXTENSION_KEY
 
 
-def test_manifest_and_registration_declare_host_api_v8(tmp_path: Path) -> None:
+def test_manifest_and_registration_declare_host_api_v9(tmp_path: Path) -> None:
     manifest = json.loads((Path(__file__).parents[1] / "manifest.json").read_text(encoding="utf-8"))
     registration = register(
         PluginContext(plugin_id=PLUGIN_ID, settings={}, data_dir=tmp_path / "plugin-data")
     )
     assert manifest["plugin_id"] == PLUGIN_ID
     assert manifest["display_name"] == DISPLAY_NAME
-    assert manifest["host_api_version"] == 8
+    assert manifest["host_api_version"] == 9
     assert manifest["dependencies"] == [
         "qbittorrent-api>=2026.8.1",
         "libtorrent==2.0.9; sys_platform == 'darwin' and platform_machine == 'x86_64'",
@@ -23,9 +23,16 @@ def test_manifest_and_registration_declare_host_api_v8(tmp_path: Path) -> None:
     ]
     assert registration.plugin_id == PLUGIN_ID
     assert registration.display_name == DISPLAY_NAME
-    assert registration.host_api_version == 8
+    assert registration.host_api_version == 9
     assert [extension.key for extension in registration.extensions] == [MEDIA_PROVIDER_EXTENSION_KEY]
     assert registration.extensions[0].data.playback_deliveries == ("proxy",)
+
+
+def test_bundle_declares_in_place_import_capability(tmp_path: Path) -> None:
+    registration = register(
+        PluginContext(plugin_id=PLUGIN_ID, settings={}, data_dir=tmp_path / "plugin-data")
+    )
+    assert registration.extensions[0].data.supports_in_place_import is True
 
 
 def test_library_configuration_is_normalised_without_creating_directories(tmp_path: Path) -> None:

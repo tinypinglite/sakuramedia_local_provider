@@ -185,6 +185,187 @@ def test_managed_media_ref_key_uses_relative_path(tmp_path: Path) -> None:
     assert key == "nested/movie.mp4"
 
 
+def _manual_source(provider: LocalStorageProvider, relative_path: str):
+    return provider.scan_import_source(
+        source_ref={
+            "version": 1,
+            "kind": "manual_local_path",
+            "relative_path": relative_path,
+        }
+    )[0]
+
+
+def _stage_in_place(
+    provider: LocalStorageProvider,
+    source,
+    *,
+    operation_key: str = "import-in-place",
+    placement: str = "jav/ABC-001/clip.mp4",
+):
+    return provider.stage_import_file(
+        source=source,
+        placement=ImportPlacement(relative_path=placement),
+        source_disposition="in_place",
+        operation_key=operation_key,
+    )
+
+
+def test_stage_in_place_references_source_without_writing_media_root(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        storage_module.MediaMetadataProbeService,
+        "probe_file",
+        lambda _path: SimpleNamespace(
+            duration_seconds=42, resolution="720x1280", video_info={"video": {}}
+        ),
+    )
+    provider, library, media_root, import_root = _provider(tmp_path)
+    source_path = import_root / "clip.mp4"
+    source_path.write_bytes(b"source-bytes")
+    source = _manual_source(provider, "clip.mp4")
+
+    staged = _stage_in_place(provider, source)
+
+    assert staged.storage_ref["kind"] == "in_place_local_path"
+    assert staged.storage_ref["relative_path"] == "clip.mp4"
+    assert all(
+        isinstance(staged.storage_ref[key], int)
+        for key in ("source_dev", "source_ino", "source_size", "source_mtime_ns")
+    )
+    assert staged.size_bytes == 12
+    assert staged.duration_seconds == 42
+    assert list(media_root.rglob("*")) == []
+
+    provider.finalize_import(receipt=staged.receipt)
+    provider.finalize_import(receipt=staged.receipt)
+
+    media = MediaHandle(
+        media_id=1,
+        library=library,
+        storage_ref=staged.storage_ref,
+        file_name="clip.mp4",
+        file_size_bytes=12,
+        duration_seconds=42,
+    )
+    assert provider.compute_file_hash(media=media)
+    assert source_path.read_bytes() == b"source-bytes"
+
+
+def test_in_place_media_validity_key_tracks_source_identity(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        storage_module.MediaMetadataProbeService,
+        "probe_file",
+        lambda _path: SimpleNamespace(duration_seconds=0, resolution=None, video_info=None),
+    )
+    provider, library, _media_root, import_root = _provider(tmp_path)
+    source_path = import_root / "clip.mp4"
+    source_path.write_bytes(b"source-bytes")
+    staged = _stage_in_place(provider, _manual_source(provider, "clip.mp4"))
+    media = MediaHandle(
+        media_id=1,
+        library=library,
+        storage_ref=staged.storage_ref,
+        file_name="clip.mp4",
+        file_size_bytes=12,
+        duration_seconds=0,
+    )
+
+    key = provider.managed_media_ref_key(media_ref=staged.storage_ref)
+    assert key in provider.scan_managed_media_ref_keys()
+
+    source_path.write_bytes(b"changed")
+
+    assert provider.managed_media_ref_key(media_ref=staged.storage_ref) not in (
+        provider.scan_managed_media_ref_keys()
+    )
+    with pytest.raises(ProviderOperationError) as error:
+        provider.compute_file_hash(media=media)
+    assert error.value.code == "source_not_found"
+
+
+def test_in_place_media_delete_and_abort_keep_source_file(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        storage_module.MediaMetadataProbeService,
+        "probe_file",
+        lambda _path: SimpleNamespace(duration_seconds=0, resolution=None, video_info=None),
+    )
+    provider, library, _media_root, import_root = _provider(tmp_path)
+    source_path = import_root / "clip.mp4"
+    source_path.write_bytes(b"source-bytes")
+    staged = _stage_in_place(provider, _manual_source(provider, "clip.mp4"))
+    media = MediaHandle(
+        media_id=1,
+        library=library,
+        storage_ref=staged.storage_ref,
+        file_name="clip.mp4",
+        file_size_bytes=12,
+        duration_seconds=0,
+    )
+
+    provider.abort_import(receipt=staged.receipt)
+    provider.delete_media(media=media)
+
+    assert source_path.read_bytes() == b"source-bytes"
+
+
+def test_in_place_cleanup_after_transfer_keeps_source_file(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        storage_module.MediaMetadataProbeService,
+        "probe_file",
+        lambda _path: SimpleNamespace(duration_seconds=0, resolution=None, video_info=None),
+    )
+    provider, library, _media_root, import_root = _provider(tmp_path)
+    source_path = import_root / "clip.mp4"
+    source_path.write_bytes(b"source-bytes")
+    staged = _stage_in_place(provider, _manual_source(provider, "clip.mp4"))
+    media = MediaHandle(
+        media_id=1,
+        library=library,
+        storage_ref=staged.storage_ref,
+        file_name="clip.mp4",
+        file_size_bytes=12,
+        duration_seconds=0,
+    )
+
+    with provider.open_transfer_source(media=media) as source:
+        provider.cleanup_transfer_source(media=media, source=source)
+
+    assert source_path.read_bytes() == b"source-bytes"
+
+
+def test_in_place_import_rejects_download_source_ref(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        storage_module.MediaMetadataProbeService,
+        "probe_file",
+        lambda _path: SimpleNamespace(duration_seconds=0, resolution=None, video_info=None),
+    )
+    provider, _library, _media_root, _import_root = _provider(tmp_path)
+    download_root = tmp_path / "downloads"
+    download_root.mkdir()
+    (download_root / "clip.mp4").write_bytes(b"source-bytes")
+    source = provider.scan_import_source(
+        source_ref={
+            "version": 1,
+            "kind": "download_local_path",
+            "relative_path": "clip.mp4",
+            "root_path": str(download_root),
+        }
+    )[0]
+
+    with pytest.raises(ProviderOperationError) as error:
+        _stage_in_place(provider, source)
+
+    assert error.value.operation == "stage_import_file"
+    assert error.value.code == "unsupported"
+
+
 def test_open_transfer_source_exposes_independent_pathless_seekable_readers(tmp_path: Path) -> None:
     provider, library, media_root, _import_root = _provider(tmp_path)
     path = media_root / "nested" / "movie.mp4"

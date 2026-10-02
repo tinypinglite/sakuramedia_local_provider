@@ -54,6 +54,9 @@ LOCAL_REF_VERSION = 1
 MEDIA_REF_KIND = "media_local_path"
 MANUAL_SOURCE_REF_KIND = "manual_local_path"
 DOWNLOAD_SOURCE_REF_KIND = "download_local_path"
+IN_PLACE_MEDIA_REF_KIND = "in_place_local_path"
+_IN_PLACE_RECEIPT_KIND = "local_in_place_import"
+_IN_PLACE_IDENTITY_FIELDS = ("source_dev", "source_ino", "source_size", "source_mtime_ns")
 _HASH_MIB = 1024 * 1024
 _HASH_HEAD_TAIL_BYTES = 3 * _HASH_MIB
 _HASH_MIDDLE_BYTES = _HASH_MIB
@@ -326,6 +329,8 @@ def _ensure_under(path: Path, root: Path) -> None:
 class LocalStorageProvider:
     """A provider-neutral local filesystem storage implementation."""
 
+    supports_in_place_import = True
+
     def __init__(self, *, library: LibraryHandle, data_dir: Path):
         config = library.provider_config
         if not isinstance(config, dict):
@@ -360,6 +365,31 @@ class LocalStorageProvider:
             "relative_path": relative_path,
         }
 
+    @staticmethod
+    def _in_place_ref(relative_path: str, identity: dict[str, int]) -> JsonObject:
+        return {
+            "version": LOCAL_REF_VERSION,
+            "kind": IN_PLACE_MEDIA_REF_KIND,
+            "relative_path": relative_path,
+            **identity,
+        }
+
+    @staticmethod
+    def _is_in_place_ref(ref: object) -> bool:
+        return isinstance(ref, dict) and ref.get("kind") == IN_PLACE_MEDIA_REF_KIND
+
+    @staticmethod
+    def _identity_from_ref(ref: object, *, operation: str) -> dict[str, int]:
+        if not isinstance(ref, dict):
+            raise _provider_error(operation, "source_not_found", "本地媒体引用无效")
+        identity = {key: ref.get(key) for key in _IN_PLACE_IDENTITY_FIELDS}
+        if not all(
+            isinstance(value, int) and not isinstance(value, bool)
+            for value in identity.values()
+        ):
+            raise _provider_error(operation, "source_not_found", "本地媒体引用无效")
+        return identity
+
     def get_space_usage(self) -> StorageSpaceUsage:
         try:
             _reject_symlink_components(self.media_root)
@@ -375,7 +405,7 @@ class LocalStorageProvider:
         )
 
     def scan_managed_media_ref_keys(self) -> set[str]:
-        """Enumerate regular files below the configured media root for validity checks."""
+        """Enumerate managed and in-place regular files for validity checks."""
         try:
             _reject_symlink_components(self.media_root)
             media_root = self.media_root.resolve(strict=False)
@@ -387,7 +417,7 @@ class LocalStorageProvider:
                 "本地媒体目录读取失败",
                 retryable=True,
             ) from exc
-        relative_paths: set[str] = set()
+        keys: set[str] = set()
         for path in candidates:
             try:
                 if path.is_symlink() or not path.is_file():
@@ -404,28 +434,82 @@ class LocalStorageProvider:
                     "本地媒体文件读取失败",
                     retryable=True,
                 ) from exc
-            relative_paths.add(relative_path)
-        return relative_paths
+            keys.add(relative_path)
+        keys.update(self._scan_in_place_ref_keys())
+        return keys
+
+    def _scan_in_place_ref_keys(self) -> set[str]:
+        try:
+            _reject_symlink_components(self.manual_import_root)
+            manual_import_root = self.manual_import_root.resolve(strict=False)
+            candidates = list(self.manual_import_root.rglob("*"))
+        except (OSError, ValueError) as exc:
+            raise _provider_error(
+                "scan_managed_media_ref_keys",
+                "unavailable",
+                "本地导入目录读取失败",
+                retryable=True,
+            ) from exc
+        keys: set[str] = set()
+        for path in candidates:
+            try:
+                if path.is_symlink() or not path.is_file():
+                    continue
+                _reject_symlink_components(path)
+                _ensure_under(path.resolve(strict=True), manual_import_root)
+                relative_path = _posix_relative(path, self.manual_import_root)
+                identity = self._source_identity(path)
+            except ValueError:
+                continue
+            except OSError as exc:
+                raise _provider_error(
+                    "scan_managed_media_ref_keys",
+                    "unavailable",
+                    "本地导入文件读取失败",
+                    retryable=True,
+                ) from exc
+            keys.add(self._in_place_key(relative_path, identity))
+        return keys
+
+    @staticmethod
+    def _in_place_key(relative_path: str, identity: dict[str, int]) -> str:
+        return "in_place:{}:{}:{}:{}:{}".format(
+            relative_path,
+            identity["source_dev"],
+            identity["source_ino"],
+            identity["source_size"],
+            identity["source_mtime_ns"],
+        )
 
     @staticmethod
     def managed_media_ref_key(*, media_ref: JsonObject) -> str:
-        if (
-            media_ref.get("version") != LOCAL_REF_VERSION
-            or media_ref.get("kind") != MEDIA_REF_KIND
-        ):
+        if not isinstance(media_ref, dict) or media_ref.get("version") != LOCAL_REF_VERSION:
+            raise _provider_error(
+                "managed_media_ref_key",
+                "source_not_found",
+                "本地媒体引用无效",
+            )
+        kind = media_ref.get("kind")
+        if kind not in {MEDIA_REF_KIND, IN_PLACE_MEDIA_REF_KIND}:
             raise _provider_error(
                 "managed_media_ref_key",
                 "source_not_found",
                 "本地媒体引用无效",
             )
         try:
-            return "/".join(_relative_parts(media_ref.get("relative_path")))
+            relative = "/".join(_relative_parts(media_ref.get("relative_path")))
         except ValueError as exc:
             raise _provider_error(
                 "managed_media_ref_key",
                 "source_not_found",
                 "本地媒体引用无效",
             ) from exc
+        if kind == MEDIA_REF_KIND:
+            return relative
+        identity = LocalStorageProvider._identity_from_ref(
+            media_ref, operation="managed_media_ref_key"
+        )
+        return LocalStorageProvider._in_place_key(relative, identity)
 
     @staticmethod
     def _manual_source_ref(relative_path: str) -> JsonObject:
@@ -928,6 +1012,56 @@ class LocalStorageProvider:
         except OSError as exc:
             raise _provider_error("stage_import_file", "unavailable", "导入源读取失败", retryable=True) from exc
 
+    def _stage_in_place(
+        self,
+        *,
+        source: ImportFile,
+        source_relative: str,
+        source_identity: dict[str, int],
+        duration_seconds: int,
+        video_info: JsonObject | None,
+        resolution: str | None,
+    ) -> StagedMedia:
+        operation = "stage_import_file"
+        _, source_kind = self._source_root_for_ref(source.source_ref, operation=operation)
+        if source_kind != MANUAL_SOURCE_REF_KIND:
+            raise _provider_error(operation, "unsupported", "原地导入仅支持手动导入目录")
+        return _staged_media(
+            storage_ref=self._in_place_ref(source_relative, source_identity),
+            receipt={
+                "version": LOCAL_REF_VERSION,
+                "kind": _IN_PLACE_RECEIPT_KIND,
+                "source_ref": source.source_ref,
+                "source_relative_path": source_relative,
+                **source_identity,
+            },
+            size_bytes=source_identity["source_size"],
+            duration_seconds=duration_seconds,
+            video_info=video_info,
+            resolution=resolution,
+        )
+
+    def _in_place_receipt_path(self, receipt: object, *, operation: str) -> Path:
+        if not isinstance(receipt, dict) or receipt.get("kind") != _IN_PLACE_RECEIPT_KIND:
+            raise _provider_error(operation, "source_not_found", "原地导入回执无效")
+        source_ref = receipt.get("source_ref")
+        source_root, source_kind = self._source_root_for_ref(source_ref, operation=operation)
+        if source_kind != MANUAL_SOURCE_REF_KIND:
+            raise _provider_error(operation, "source_not_found", "原地导入回执无效")
+        path, relative = self._path_from_ref(
+            source_ref,
+            root=source_root,
+            operation=operation,
+            require_file=True,
+            expected_kind=source_kind,
+        )
+        if receipt.get("source_relative_path") != relative:
+            raise _provider_error(operation, "source_not_found", "原地导入回执无效")
+        identity = self._identity_from_ref(receipt, operation=operation)
+        if not self._same_source_identity(path, identity):
+            raise _provider_error(operation, "source_not_found", "源文件已变化，未完成原地导入")
+        return path
+
     @staticmethod
     def _same_operation_request(
         journal: dict[str, Any],
@@ -969,12 +1103,13 @@ class LocalStorageProvider:
         *,
         source: ImportFile,
         placement: ImportPlacement,
-        source_disposition: Literal["keep", "delete_after_commit"],
+        source_disposition: Literal["keep", "delete_after_commit", "in_place"],
         operation_key: str,
     ) -> StagedMedia:
         if not isinstance(source_disposition, str) or source_disposition not in {
             "keep",
             "delete_after_commit",
+            "in_place",
         }:
             raise _provider_error("stage_import_file", "invalid_config", "源文件处置方式无效")
         try:
@@ -985,6 +1120,15 @@ class LocalStorageProvider:
         metadata = MediaMetadataProbeService.probe_file(source_path)
         duration_seconds = max(0, int(metadata.duration_seconds or 0))
         resolution = getattr(metadata, "resolution", None)
+        if source_disposition == "in_place":
+            return self._stage_in_place(
+                source=source,
+                source_relative=source_relative,
+                source_identity=source_identity,
+                duration_seconds=duration_seconds,
+                video_info=metadata.video_info,
+                resolution=resolution,
+            )
         if source_disposition == "delete_after_commit":
             self._reject_media_library_source(source_path, operation="stage_import_file")
         try:
@@ -1109,6 +1253,9 @@ class LocalStorageProvider:
         )
 
     def finalize_import(self, *, receipt: JsonObject) -> None:
+        if isinstance(receipt, dict) and receipt.get("kind") == _IN_PLACE_RECEIPT_KIND:
+            self._in_place_receipt_path(receipt, operation="finalize_import")
+            return
         journal = self._receipt_journal(receipt, operation="finalize_import")
         if journal["state"] in {_OPERATION_STATE_ABORTED, _OPERATION_STATE_FINALIZED}:
             return
@@ -1145,6 +1292,8 @@ class LocalStorageProvider:
         self._write_journal(journal, operation="finalize_import")
 
     def abort_import(self, *, receipt: JsonObject) -> None:
+        if isinstance(receipt, dict) and receipt.get("kind") == _IN_PLACE_RECEIPT_KIND:
+            return
         journal = self._receipt_journal(receipt, operation="abort_import")
         if journal["state"] in {_OPERATION_STATE_ABORTED, _OPERATION_STATE_FINALIZED}:
             return
@@ -1161,6 +1310,9 @@ class LocalStorageProvider:
         self._write_journal(journal, operation="abort_import")
 
     def delete_media(self, *, media: MediaHandle) -> None:
+        if self._is_in_place_ref(media.storage_ref):
+            # 原地导入的文件归外部位置管理，删除媒体记录不删除源文件。
+            return
         path, _ = self._path_from_ref(
             media.storage_ref,
             root=self.media_root,
@@ -1182,6 +1334,18 @@ class LocalStorageProvider:
             ) from exc
 
     def _media_path(self, media: MediaHandle, *, operation: str) -> Path:
+        if self._is_in_place_ref(media.storage_ref):
+            path, _ = self._path_from_ref(
+                media.storage_ref,
+                root=self.manual_import_root,
+                operation=operation,
+                require_file=True,
+                expected_kind=IN_PLACE_MEDIA_REF_KIND,
+            )
+            identity = self._identity_from_ref(media.storage_ref, operation=operation)
+            if not self._same_source_identity(path, identity):
+                raise _provider_error(operation, "source_not_found", "媒体文件已变化")
+            return path
         path, _ = self._path_from_ref(
             media.storage_ref,
             root=self.media_root,
@@ -1248,6 +1412,9 @@ class LocalStorageProvider:
             or source._media != media
         ):
             raise _provider_error(operation, "invalid_config", "源会话与媒体不匹配")
+        if self._is_in_place_ref(media.storage_ref):
+            # 原地导入的媒体迁移成功后保留本地源文件，不自动清理。
+            return
         try:
             source._ensure_open()
             path = self._media_path(media, operation=operation)
