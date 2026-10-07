@@ -638,6 +638,107 @@ def test_delete_only_managed_tasks_and_is_idempotent(provider) -> None:
     client.delete_task(remote_id=HASH, delete_files=False)
 
 
+def test_delete_with_files_removes_task_directory(provider) -> None:
+    client, fake = provider
+    task_dir = Path(client.backend_import_root_path) / f"ABC-001-{HASH[:6]}"
+    task_dir.mkdir(parents=True)
+    (task_dir / "movie.mp4").write_bytes(b"data")
+    fake.items = [
+        SimpleNamespace(
+            hash=HASH,
+            tags="sakuramedia,client:7",
+            save_path=f"/downloads/{task_dir.name}",
+        )
+    ]
+
+    client.delete_task(remote_id=HASH, delete_files=True)
+
+    assert fake.delete_calls == [{"torrent_hashes": HASH, "delete_files": True}]
+    assert not task_dir.exists()
+
+
+def test_delete_without_files_keeps_task_directory(provider) -> None:
+    client, fake = provider
+    task_dir = Path(client.backend_import_root_path) / f"ABC-001-{HASH[:6]}"
+    task_dir.mkdir(parents=True)
+    fake.items = [
+        SimpleNamespace(
+            hash=HASH,
+            tags="sakuramedia,client:7",
+            save_path=f"/downloads/{task_dir.name}",
+        )
+    ]
+
+    client.delete_task(remote_id=HASH, delete_files=False)
+
+    assert fake.delete_calls == [{"torrent_hashes": HASH, "delete_files": False}]
+    assert task_dir.exists()
+
+
+def test_delete_falls_back_to_hash_suffix_directory(provider) -> None:
+    client, fake = provider
+    task_dir = Path(client.backend_import_root_path) / f"ABC-001-{HASH[:6]}"
+    task_dir.mkdir(parents=True)
+    fake.items = []
+
+    client.delete_task(remote_id=HASH, delete_files=True)
+
+    assert fake.delete_calls == []
+    assert not task_dir.exists()
+
+
+def test_delete_ignores_unowned_directories(provider) -> None:
+    client, fake = provider
+    backend_root = Path(client.backend_import_root_path)
+    foreign = backend_root / "other-library"
+    foreign.mkdir(parents=True)
+    fake.items = [
+        SimpleNamespace(hash=HASH, tags="sakuramedia,client:7", save_path="/other/foreign"),
+    ]
+
+    client.delete_task(remote_id=HASH, delete_files=True)
+
+    assert fake.delete_calls == [{"torrent_hashes": HASH, "delete_files": True}]
+    assert foreign.exists()
+
+
+def test_delete_skips_ambiguous_leftover_directories(provider) -> None:
+    client, fake = provider
+    backend_root = Path(client.backend_import_root_path)
+    first = backend_root / f"AAA-{HASH[:6]}"
+    second = backend_root / f"BBB-{HASH[:6]}"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+    fake.items = []
+
+    client.delete_task(remote_id=HASH, delete_files=True)
+
+    assert first.exists()
+    assert second.exists()
+
+
+def test_delete_does_not_follow_symlinked_task_directory(provider) -> None:
+    client, fake = provider
+    backend_root = Path(client.backend_import_root_path)
+    backend_root.mkdir(parents=True)
+    target = backend_root / "real-target"
+    target.mkdir()
+    link = backend_root / f"ABC-001-{HASH[:6]}"
+    link.symlink_to(target)
+    fake.items = [
+        SimpleNamespace(
+            hash=HASH,
+            tags="sakuramedia,client:7",
+            save_path=f"/downloads/{link.name}",
+        )
+    ]
+
+    client.delete_task(remote_id=HASH, delete_files=True)
+
+    assert link.is_symlink()
+    assert target.exists()
+
+
 def test_upstream_errors_are_structured_and_safe(provider) -> None:
     client, fake = provider
     class LoginFailed(Exception):

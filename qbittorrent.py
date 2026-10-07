@@ -15,6 +15,7 @@ import os
 import posixpath
 import re
 import secrets
+import shutil
 import time
 from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
@@ -1050,18 +1051,106 @@ class QbittorrentDownloadProvider:
     def delete_task(self, *, remote_id: str, delete_files: bool) -> None:
         if not isinstance(remote_id, str) or not remote_id.strip() or not isinstance(delete_files, bool):
             raise _error("delete_task", "invalid_config", "下载任务参数无效")
+        remote_id = remote_id.strip()
         self._login()
-        item = self._find(remote_id.strip(), operation="delete_task")
-        if item is None:
-            return
-        if not _managed(_value(item, "tags", ""), self.client_handle.client_id):
+        item = self._find(remote_id, operation="delete_task")
+        if item is not None and not _managed(_value(item, "tags", ""), self.client_handle.client_id):
             raise _error("delete_task", "task_not_managed", "下载任务不受当前客户端管理")
+        shell = (
+            self._backend_path_for_save_path(_value(item, "save_path", ""))
+            if item is not None
+            else None
+        )
+        if item is not None:
+            try:
+                self.client.torrents_delete(
+                    torrent_hashes=remote_id,
+                    delete_files=delete_files,
+                )
+            except Exception as exc:
+                if not self._is_missing(exc):
+                    raise self._project_qb_error("delete_task", "qBittorrent 删除任务失败", exc) from exc
+        if delete_files:
+            self._remove_task_directories(remote_id, preferred=shell)
+
+    def _backend_path_for_save_path(self, value: object) -> Path | None:
+        """将 qB 侧 save_path 映射为后端可见的任务目录。
+
+        只接受下载根下的单段子目录；其余（根外、嵌套、符号链接）一律视为不归
+        本客户端所有，不做删除。
+        """
+        if not isinstance(value, str) or not value.strip():
+            return None
+        text = value.strip()
+        if "\x00" in text or "\\" in text:
+            return None
+        root = PurePosixPath(self.remote_save_root)
+        normalized = PurePosixPath(posixpath.normpath(text))
         try:
-            self.client.torrents_delete(
-                torrent_hashes=remote_id.strip(),
-                delete_files=delete_files,
-            )
-        except Exception as exc:
-            if self._is_missing(exc):
+            relative = normalized.relative_to(root).as_posix()
+        except ValueError:
+            return None
+        if not relative or relative == "." or "/" in relative or ".." in relative.split("/"):
+            return None
+        candidate = Path(self.backend_import_root_path) / relative
+        try:
+            _reject_symlink_components(candidate)
+        except ValueError:
+            return None
+        return candidate
+
+    def _remove_task_directories(self, remote_id: str, *, preferred: Path | None) -> None:
+        """尽力删除任务目录：优先 qB 报告的 save_path，缺失时按命名约定兜底。
+
+        兜底只认目录名等于 info_hash 或以 `-<hash 前 6 位>` 结尾、且位于下载根下
+        的子目录；匹配到多个（理论上极端哈希前缀碰撞）时放弃，避免误删。
+        """
+        if preferred is not None:
+            candidates = [preferred]
+        else:
+            candidates = self._leftover_task_directories(remote_id)
+            if len(candidates) > 1:
+                logger.warning(
+                    "qB task directory cleanup skipped: ambiguous matches client_id=%s info_hash=%s paths=%s",
+                    self.client_handle.client_id,
+                    remote_id,
+                    [str(path) for path in candidates],
+                )
                 return
-            raise self._project_qb_error("delete_task", "qBittorrent 删除任务失败", exc) from exc
+        for path in candidates:
+            try:
+                if not path.is_dir():
+                    continue
+                _reject_symlink_components(path)
+                shutil.rmtree(path)
+                logger.info(
+                    "qB task directory removed client_id=%s info_hash=%s path=%s",
+                    self.client_handle.client_id,
+                    remote_id,
+                    path,
+                )
+            except (OSError, ValueError) as exc:
+                logger.warning(
+                    "qB task directory cleanup failed client_id=%s info_hash=%s path=%s error=%s",
+                    self.client_handle.client_id,
+                    remote_id,
+                    path,
+                    exc,
+                )
+
+    def _leftover_task_directories(self, remote_id: str) -> list[Path]:
+        root = Path(self.backend_import_root_path)
+        suffix = f"-{remote_id[:6].lower()}"
+        try:
+            children = list(root.iterdir())
+        except OSError as exc:
+            logger.warning("qB leftover directory scan failed root=%s error=%s", root, exc)
+            return []
+        matches: list[Path] = []
+        for child in children:
+            if not child.is_dir():
+                continue
+            name = child.name
+            if name == remote_id or name.lower().endswith(suffix):
+                matches.append(child)
+        return matches
