@@ -652,6 +652,122 @@ def test_delete_after_commit_rejects_source_inside_media_root(tmp_path: Path) ->
     assert source_path.read_bytes() == b"existing"
 
 
+def _manual_source_ref(relative_path: str) -> dict:
+    return {
+        "version": 1,
+        "kind": "manual_local_path",
+        "relative_path": relative_path,
+    }
+
+
+def _download_source_ref(root: Path, relative_path: str = "") -> dict:
+    return {
+        "version": 1,
+        "kind": "download_local_path",
+        "root_path": str(root),
+        "relative_path": relative_path,
+    }
+
+
+@pytest.mark.parametrize(
+    "source_disposition", ["keep", "delete_after_commit", "in_place"]
+)
+def test_validate_import_source_rejects_media_root_itself(
+    tmp_path: Path, source_disposition: str
+) -> None:
+    provider, _library, media_root, _import_root = _provider(tmp_path)
+
+    with pytest.raises(ProviderOperationError) as error:
+        provider.validate_import_source(
+            source_ref=_download_source_ref(media_root),
+            source_disposition=source_disposition,
+        )
+
+    assert error.value.code == "invalid_config"
+
+
+def test_validate_import_source_rejects_parent_of_media_root(
+    tmp_path: Path,
+) -> None:
+    provider, _library, _media_root, _import_root = _provider(tmp_path)
+
+    with pytest.raises(ProviderOperationError) as error:
+        provider.validate_import_source(
+            source_ref=_download_source_ref(tmp_path),
+            source_disposition="keep",
+        )
+
+    assert error.value.code == "invalid_config"
+
+
+@pytest.mark.parametrize("relative_path", ["existing.mp4", "nested"])
+def test_validate_import_source_rejects_source_inside_media_root(
+    tmp_path: Path, relative_path: str
+) -> None:
+    provider, _library, media_root, _import_root = _provider(tmp_path)
+    (media_root / "existing.mp4").write_bytes(b"existing")
+    (media_root / "nested").mkdir()
+
+    with pytest.raises(ProviderOperationError) as error:
+        provider.validate_import_source(
+            source_ref=_download_source_ref(media_root, relative_path),
+            source_disposition="keep",
+        )
+
+    assert error.value.code == "invalid_config"
+
+
+def test_validate_import_source_allows_disjoint_sources(tmp_path: Path) -> None:
+    provider, _library, _media_root, import_root = _provider(tmp_path)
+    (import_root / "video.mp4").write_bytes(b"video")
+
+    provider.validate_import_source(
+        source_ref=_manual_source_ref("video.mp4"),
+        source_disposition="keep",
+    )
+    provider.validate_import_source(
+        source_ref=_download_source_ref(import_root),
+        source_disposition="delete_after_commit",
+    )
+    # 库外不存在的路径由后续 scan 报 source_not_found；守卫本身放行。
+    provider.validate_import_source(
+        source_ref=_manual_source_ref("missing.mp4"),
+        source_disposition="in_place",
+    )
+
+
+def test_validate_import_source_rejects_symlink_into_media_root(
+    tmp_path: Path,
+) -> None:
+    provider, _library, media_root, import_root = _provider(tmp_path)
+    (media_root / "existing.mp4").write_bytes(b"existing")
+    link = import_root / "link.mp4"
+    try:
+        link.symlink_to(media_root / "existing.mp4")
+    except OSError:
+        pytest.skip("symlink creation is unavailable")
+
+    with pytest.raises(ProviderOperationError) as error:
+        provider.validate_import_source(
+            source_ref=_manual_source_ref("link.mp4"),
+            source_disposition="keep",
+        )
+
+    assert error.value.code == "source_not_found"
+
+
+def test_validate_import_source_rejects_invalid_ref(tmp_path: Path) -> None:
+    provider, _library, _media_root, _import_root = _provider(tmp_path)
+
+    with pytest.raises(ProviderOperationError) as error:
+        provider.validate_import_source(
+            source_ref={"version": 1, "kind": "unknown_local_path", "relative_path": "x"},
+            source_disposition="keep",
+        )
+
+    assert error.value.code == "source_not_found"
+
+
 def test_read_and_delete_import_file_uses_identity_receipt(tmp_path: Path) -> None:
     provider, _library, _media_root, import_root = _provider(tmp_path)
     source_path = import_root / "ABC-001.srt"

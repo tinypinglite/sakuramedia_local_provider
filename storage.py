@@ -704,6 +704,50 @@ class LocalStorageProvider:
         report(f"本地扫描完成 · 发现 {len(result)} 个文件", total, total, force=True)
         return tuple(result)
 
+    @staticmethod
+    def _paths_overlap(left: Path, right: Path) -> bool:
+        try:
+            left.relative_to(right)
+        except ValueError:
+            pass
+        else:
+            return True
+        try:
+            right.relative_to(left)
+        except ValueError:
+            return False
+        return True
+
+    def validate_import_source(
+        self, *, source_ref: JsonObject, source_disposition: str
+    ) -> None:
+        operation = "validate_import_source"
+        source_root, source_kind = self._source_root_for_ref(
+            source_ref, operation=operation
+        )
+        source_path, _relative = self._path_from_ref(
+            source_ref,
+            root=source_root,
+            operation=operation,
+            expected_kind=source_kind,
+        )
+        try:
+            source_resolved = source_path.resolve(strict=False)
+            media_resolved = self.media_root.resolve(strict=False)
+        except (OSError, RuntimeError) as exc:
+            raise _provider_error(
+                operation,
+                "unavailable",
+                "导入源路径不可用，请稍后重试",
+                retryable=True,
+            ) from exc
+        if self._paths_overlap(source_resolved, media_resolved):
+            raise _provider_error(
+                operation,
+                "invalid_config",
+                "导入源与媒体库目录重叠，请选择媒体库目录之外的位置",
+            )
+
     def get_import_source_identity(self, *, source: ImportFile) -> str:
         path, _relative, identity = self._source_for(source)
         payload = json.dumps(
