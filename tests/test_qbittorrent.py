@@ -343,6 +343,31 @@ def test_submit_torrent_downloads_url_and_submits_bytes(monkeypatch: pytest.Monk
     assert "urls" not in fake.add_calls[0]
 
 
+def test_submit_uploaded_torrent_bytes_skips_url_fetch(
+    monkeypatch: pytest.MonkeyPatch, provider
+) -> None:
+    client, fake = provider
+    lt_module = types.ModuleType("libtorrent")
+    lt_module.torrent_info = lambda payload: SimpleNamespace(info_hash=lambda: HASH)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "libtorrent", lt_module)
+
+    task = client.submit(
+        submission=DownloadSubmission(
+            source_uri=f"magnet:?xt=urn:btih:{HASH}",
+            display_name="Uploaded",
+            torrent_bytes=b"uploaded-torrent",
+        )
+    )
+
+    assert task.remote_id == HASH
+    assert fake.add_calls[0]["torrent_files"] == b"uploaded-torrent"
+    assert "urls" not in fake.add_calls[0]
+
+
+def test_download_component_advertises_torrent_bytes() -> None:
+    assert qbittorrent.QbittorrentDownloadComponent.supports_torrent_bytes is True
+
+
 def test_submit_torrent_redirected_to_magnet_submits_magnet(
     monkeypatch: pytest.MonkeyPatch, provider
 ) -> None:

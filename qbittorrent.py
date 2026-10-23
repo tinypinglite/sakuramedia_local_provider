@@ -234,6 +234,8 @@ def _torrent_hash(item: object) -> str:
 class QbittorrentDownloadComponent:
     """Declaration and construction boundary for qBittorrent downloads."""
 
+    supports_torrent_bytes = True
+
     def __init__(self, *, data_dir: Path) -> None:
         self.data_dir = data_dir
 
@@ -856,7 +858,13 @@ class QbittorrentDownloadProvider:
         except (httpx.HTTPError, OSError) as exc:
             raise _error("submit", "unavailable", "种子文件下载失败", retryable=True) from exc
 
-    def _source(self, source_uri: str) -> tuple[str, Literal["magnet", "torrent"], str | bytes]:
+    def _source(
+        self, source_uri: str, torrent_bytes: bytes | None = None
+    ) -> tuple[str, Literal["magnet", "torrent"], str | bytes]:
+        if torrent_bytes is not None:
+            if len(torrent_bytes) > MAX_TORRENT_BYTES:
+                raise _error("submit", "unsupported", "种子文件超过大小限制")
+            return self._parse_torrent_hash(torrent_bytes), "torrent", torrent_bytes
         if _is_magnet(source_uri):
             try:
                 info_hash = parse_hash_from_magnet(source_uri)
@@ -893,7 +901,9 @@ class QbittorrentDownloadProvider:
                 raise ValueError("empty source")
         except (AttributeError, TypeError, ValueError) as exc:
             raise _error("submit", "invalid_config", "下载提交参数无效") from exc
-        info_hash, source_kind, source_payload = self._source(source_uri)
+        info_hash, source_kind, source_payload = self._source(
+            source_uri, getattr(submission, "torrent_bytes", None)
+        )
         if info_hash in self._dead_hashes():
             logger.info(
                 "qB torrent submission rejected because the hash is blacklisted "
