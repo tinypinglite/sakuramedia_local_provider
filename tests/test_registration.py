@@ -4,11 +4,11 @@ import json
 from pathlib import Path
 
 from sakuramedia_local_provider.plugin import DISPLAY_NAME, PLUGIN_ID, register
-from src.plugins import PluginContext
+from src.plugins import HOST_API_VERSION, PluginContext
 from src.plugins.provider_protocol import MEDIA_PROVIDER_EXTENSION_KEY
 
 
-def test_manifest_and_registration_declare_host_api_v10(tmp_path: Path) -> None:
+def test_manifest_and_registration_declare_compatible_host_api(tmp_path: Path) -> None:
     manifest = json.loads((Path(__file__).parents[1] / "manifest.json").read_text(encoding="utf-8"))
     registration = register(
         PluginContext(plugin_id=PLUGIN_ID, settings={}, data_dir=tmp_path / "plugin-data")
@@ -23,7 +23,8 @@ def test_manifest_and_registration_declare_host_api_v10(tmp_path: Path) -> None:
     ]
     assert registration.plugin_id == PLUGIN_ID
     assert registration.display_name == DISPLAY_NAME
-    assert registration.host_api_version == 10
+    # manifest 是导入前的兼容下限；官方插件按宿主当前常量注册（loader 两种都接受）。
+    assert registration.host_api_version == HOST_API_VERSION
     assert [extension.key for extension in registration.extensions] == [MEDIA_PROVIDER_EXTENSION_KEY]
     assert registration.extensions[0].data.playback_deliveries == ("proxy",)
 
