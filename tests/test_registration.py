@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+from functools import partial
 from pathlib import Path
 
 from sakuramedia_local_provider.plugin import DISPLAY_NAME, PLUGIN_ID, register
+
 from src.plugins import HOST_API_VERSION, PluginContext
+from src.plugins.i18n import PluginI18n
 from src.plugins.provider_protocol import MEDIA_PROVIDER_EXTENSION_KEY
 
 
@@ -15,7 +18,7 @@ def test_manifest_and_registration_declare_compatible_host_api(tmp_path: Path) -
     )
     assert manifest["plugin_id"] == PLUGIN_ID
     assert manifest["display_name"] == DISPLAY_NAME
-    assert manifest["host_api_version"] == 10
+    assert manifest["host_api_version"] == 12
     assert manifest["dependencies"] == [
         "qbittorrent-api>=2026.8.1",
         "libtorrent==2.0.9; sys_platform == 'darwin' and platform_machine == 'x86_64'",
@@ -78,4 +81,7 @@ def test_empty_directory_cleanup_is_manual_and_has_no_parameters(tmp_path: Path)
     assert job.task_key == 'sakuramedia_local_cleanup_empty_media_dirs'
     assert job.manual_only and job.manual_trigger_allowed
     assert job.params_schema is None
-    assert job.handler is cleanup_empty_media_dirs
+    # 处理器绑定插件上下文里的翻译器，语言跟随任务语言。
+    assert isinstance(job.handler, partial)
+    assert job.handler.func is cleanup_empty_media_dirs
+    assert isinstance(job.handler.keywords["i18n"], PluginI18n)

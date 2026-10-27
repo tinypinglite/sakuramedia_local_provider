@@ -34,6 +34,28 @@
 
 本地存储仅支持「后端代理」播放，因此影片详情的「媒体源」不会显示「302直连」切换。
 
+## 多语言
+
+本插件声明 Host API 12，支持 `zh-CN` / `en`：
+
+- 语言包放在 `i18n/zh-CN.json`、`i18n/en.json`；`translations.py` 只负责在
+  插件导入时读取它们并生成静态 `*_i18n` 字典，也提供运行时翻译器
+  `Translator`。
+- 插件名：`manifest.json` 的 `display_name_i18n` +
+  `PluginRegistration.display_name_i18n`；媒体 Provider 的展示名用
+  `LocalMediaProviderBundle.display_name_i18n`。三处都是可选字段，缺失时回退原文。
+- 存储与下载器配置项：`ConfigField` 的 `label_i18n` / `description_i18n` /
+  `hint_i18n`。
+- 任务说明：`JobDefinition.cli_help_i18n`。
+- 运行时文本（导入、扫描、缩略图、清理任务进度，Provider 错误
+  `safe_message`，诊断检查 `message`）：`context.i18n.t(key, default=..., **params)`。
+  翻译器随 `register(context)` 注入媒体 Provider bundle、存储 Provider 和
+  qBittorrent 组件；语言在每次调用时按当前请求/任务上下文解析。
+- 语言包 key 在两个文件中必须完全一致，占位符统一用 `{name}`；中文值就是
+  源码里的原始文案。
+- 新增语言时，在 `i18n/` 增加同名 JSON，并补 manifest / registration 的
+  `display_name_i18n`。
+
 ## 清理空目录
 
 手动运行「清理本地媒体库空目录（请在无导入、转移任务时运行）」任务，会清理所有本地媒体库 `jav/`、`videos/` 内的空子目录，保留媒体库根目录及这两个顶层目录。含有任意文件（包括隐藏文件和零字节文件）或符号链接的目录会保留，不跟随符号链接，也不创建缺失的目录。

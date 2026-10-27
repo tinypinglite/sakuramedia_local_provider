@@ -10,6 +10,8 @@ from pathlib import Path
 
 from loguru import logger
 
+from .translations import Translator
+
 _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 
 
@@ -21,8 +23,9 @@ class _Directory:
 
 
 class _Progress:
-    def __init__(self, reporter):
+    def __init__(self, reporter, i18n=None):
         self.reporter = reporter
+        self.translations = Translator(i18n)
         self.stats = {
             "scanned": 0,
             "scanned_entries": 0,
@@ -38,7 +41,7 @@ class _Progress:
         self.total = 0
         self.last_report = self.last_log = float("-inf")
 
-    def report(self, action, *, force=False):
+    def report(self, action_key, *, force=False):
         now = time.monotonic()
         report = force or now - self.last_report >= 2
         log = force or now - self.last_log >= 10
@@ -46,16 +49,32 @@ class _Progress:
             return
         s = self.stats
         current = s["scanned"] if self.stage == 1 else s["processed"]
-        stage = "扫描目录" if self.stage == 1 else "清理空目录"
-        counts = (
-            f"已检查 {current} 个目录/{s['scanned_entries']} 个条目 · 待处理总量未知"
-            if self.stage == 1
-            else f"已处理 {current}/{self.total} · 待处理 {s['pending']}"
-        )
-        text = (
-            f"阶段 {self.stage}/2 · {stage} · {self.location}{action} · {counts} · "
-            f"删除 {s['succeeded']} · 跳过 {s['skipped']} · 失败 {s['failed']} · "
-            f"扫描错误 {s['scan_errors']}"
+        if self.stage == 1:
+            stage = self.translations.t("cleanup.stage.scan")
+            counts = self.translations.t(
+                "cleanup.counts.scan",
+                current=current,
+                entries=s["scanned_entries"],
+            )
+        else:
+            stage = self.translations.t("cleanup.stage.clean")
+            counts = self.translations.t(
+                "cleanup.counts.clean",
+                current=current,
+                total=self.total,
+                pending=s["pending"],
+            )
+        text = self.translations.t(
+            "cleanup.progress.line",
+            stage_no=self.stage,
+            stage=stage,
+            location=self.location,
+            action=self.translations.t(action_key),
+            counts=counts,
+            deleted=s["succeeded"],
+            skipped=s["skipped"],
+            failed=s["failed"],
+            scan_errors=s["scan_errors"],
         )
         if report:
             summary = dict(s)
@@ -83,7 +102,7 @@ class _Progress:
         self.stats["processed"] += 1
         self.stats[outcome] += 1
         self.stats["pending"] -= 1
-        self.report("正在处理目录")
+        self.report("cleanup.action.processing")
 
 
 def _open_root(path):
@@ -108,11 +127,11 @@ def _scan(root, progress, protected):
             node, fd, children = frames[-1]
             if children is None:
                 try:
-                    progress.report("正在读取目录条目")
+                    progress.report("cleanup.action.reading_entries")
                     with os.scandir(fd) as entries:
                         for entry in entries:
                             progress.stats["scanned_entries"] += 1
-                            progress.report("正在读取目录条目")
+                            progress.report("cleanup.action.reading_entries")
                             path = node.path / entry.name
                             if path not in protected and entry.is_dir(
                                 follow_symlinks=False
@@ -132,7 +151,7 @@ def _scan(root, progress, protected):
                 frames.pop()
                 continue
             try:
-                progress.report("正在打开子目录")
+                progress.report("cleanup.action.opening_subdirectory")
                 child_fd = os.open(child.path.name, _DIRECTORY_FLAGS, dir_fd=fd)
             except FileNotFoundError:
                 child.blocked = True
@@ -171,7 +190,7 @@ def _clean(root, progress):
                     node.blocked = True
                     continue
                 try:
-                    progress.report("正在打开待清理目录")
+                    progress.report("cleanup.action.opening_target")
                     child_fd = os.open(
                         child.path.name, _DIRECTORY_FLAGS, dir_fd=parent_fd
                     )
@@ -231,9 +250,9 @@ def _load_media_libraries():
     )
 
 
-def cleanup_empty_media_dirs(reporter, params):
-    progress = _Progress(reporter)
-    progress.report("开始读取媒体库", force=True)
+def cleanup_empty_media_dirs(reporter, params, *, i18n=None):
+    progress = _Progress(reporter, i18n)
+    progress.report("cleanup.action.reading_libraries", force=True)
     roots = []
     media_roots = set()
     for library in _load_media_libraries():
@@ -252,7 +271,12 @@ def cleanup_empty_media_dirs(reporter, params):
     for index, media_root in enumerate(sorted(media_roots), 1):
         for name in ("jav", "videos"):
             path = media_root / name
-            progress.location = f"媒体库 {index}/{len(media_roots)} · {name} · "
+            progress.location = progress.translations.t(
+                "cleanup.location.library",
+                index=index,
+                total=len(media_roots),
+                name=name,
+            )
             root = _Directory(path)
             try:
                 _scan(root, progress, protected)
@@ -264,13 +288,18 @@ def cleanup_empty_media_dirs(reporter, params):
             roots.append(root)
     progress.location = ""
     progress.total = progress.stats["scanned"]
-    progress.report("扫描结束", force=True)
+    progress.report("cleanup.action.scan_finished", force=True)
     progress.stage = 2
     progress.total = sum(_count_children(root) for root in roots)
     progress.stats["pending"] = progress.total
-    progress.report("开始清理", force=True)
+    progress.report("cleanup.action.starting_clean", force=True)
     for index, root in enumerate(roots, 1):
-        progress.location = f"目录入口 {index}/{len(roots)} · {root.path.name} · "
+        progress.location = progress.translations.t(
+            "cleanup.location.directory",
+            index=index,
+            total=len(roots),
+            name=root.path.name,
+        )
         try:
             _clean(root, progress)
         except OSError as exc:
@@ -284,9 +313,9 @@ def cleanup_empty_media_dirs(reporter, params):
                 progress.finish(outcome)
     progress.location = ""
     progress.report(
-        "任务完成；扫描错误范围未完成检查"
+        "cleanup.action.done_with_scan_errors"
         if progress.stats["scan_errors"]
-        else "任务完成",
+        else "cleanup.action.done",
         force=True,
     )
     return dict(progress.stats)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from functools import partial
 from pathlib import Path
 
 from src.plugins import (
@@ -24,9 +25,11 @@ from src.scheduler.contracts import JobDefinition
 from .cleanup import cleanup_empty_media_dirs
 from .qbittorrent import QbittorrentDownloadComponent
 from .storage import LocalStorageProvider, _reject_symlink_components
+from .translations import Translator, text, text_map
 
 PLUGIN_ID = "sakuramedia_local_provider"
 DISPLAY_NAME = "本地存储与 qBittorrent"
+DISPLAY_NAME_I18N = text_map("manifest.display_name")
 VERSION = json.loads(
     Path(__file__).with_name("manifest.json").read_text(encoding="utf-8")
 )["version"]
@@ -39,6 +42,9 @@ LIBRARY_CONFIG_FIELDS = (
         required=True,
         description="媒体文件导入后的最终存放目录,填绝对路径",
         hint="例如: /mnt/media",
+        label_i18n=text_map("settings.media_root_path.label"),
+        description_i18n=text_map("settings.media_root_path.description"),
+        hint_i18n=text_map("settings.media_root_path.hint"),
     ),
     ConfigField(
         key="manual_import_root_path",
@@ -47,6 +53,9 @@ LIBRARY_CONFIG_FIELDS = (
         required=True,
         description="手动浏览和导入本地文件时使用的目录；用于导入已有媒体。",
         hint="/mnt",
+        label_i18n=text_map("settings.manual_import_root_path.label"),
+        description_i18n=text_map("settings.manual_import_root_path.description"),
+        hint_i18n=text_map("settings.manual_import_root_path.hint"),
     ),
 )
 
@@ -64,14 +73,16 @@ def _normalise_path(value: object) -> str:
 class LocalMediaProviderBundle:
     provider_key = "local"
     display_name = DISPLAY_NAME
+    display_name_i18n = DISPLAY_NAME_I18N
     library_config_fields = LIBRARY_CONFIG_FIELDS
     playback_deliveries = ("proxy",)
     merged_playback_format = "mp4"
     supports_in_place_import = LocalStorageProvider.supports_in_place_import
 
-    def __init__(self, *, data_dir: Path) -> None:
+    def __init__(self, *, data_dir: Path, i18n: object | None = None) -> None:
         self.data_dir = data_dir
-        self.downloads = QbittorrentDownloadComponent(data_dir=data_dir)
+        self.translations = Translator(i18n)
+        self.downloads = QbittorrentDownloadComponent(data_dir=data_dir, i18n=i18n)
 
     def prepare_library(
         self,
@@ -84,7 +95,7 @@ class LocalMediaProviderBundle:
                 provider_key=self.provider_key,
                 operation="prepare_library",
                 code="invalid_config",
-                safe_message="本地存储配置无效",
+                safe_message=self.translations.t("storage.error.invalid_config"),
                 retryable=False,
             )
         if set(submitted_config) != {"media_root_path", "manual_import_root_path"}:
@@ -92,7 +103,7 @@ class LocalMediaProviderBundle:
                 provider_key=self.provider_key,
                 operation="prepare_library",
                 code="invalid_config",
-                safe_message="本地存储配置字段无效",
+                safe_message=self.translations.t("storage.error.invalid_config_fields"),
                 retryable=False,
             )
         try:
@@ -107,21 +118,25 @@ class LocalMediaProviderBundle:
                 provider_key=self.provider_key,
                 operation="prepare_library",
                 code="invalid_config",
-                safe_message="本地存储路径配置无效",
+                safe_message=self.translations.t("storage.error.invalid_library_path"),
                 retryable=False,
             ) from exc
         return PreparedLibrary(provider_config=config, account_key=None)
 
     def build_storage(self, *, library: LibraryHandle) -> LocalStorageProvider:
-        return LocalStorageProvider(library=library, data_dir=self.data_dir)
+        return LocalStorageProvider(
+            library=library, data_dir=self.data_dir, i18n=self.translations.i18n
+        )
 
 
 def register(context: PluginContext) -> PluginRegistration:
     """Declare the provider without touching configured library paths."""
-    bundle = LocalMediaProviderBundle(data_dir=context.data_dir)
+    bundle = LocalMediaProviderBundle(data_dir=context.data_dir, i18n=context.i18n)
+
     return PluginRegistration(
         plugin_id=PLUGIN_ID,
         display_name=DISPLAY_NAME,
+        display_name_i18n=DISPLAY_NAME_I18N,
         version=VERSION,
         host_api_version=HOST_API_VERSION,
         jobs=(
@@ -129,9 +144,10 @@ def register(context: PluginContext) -> PluginRegistration:
                 task_key="sakuramedia_local_cleanup_empty_media_dirs",
                 log_name="local-cleanup-empty-media-dirs",
                 cli_name="local-cleanup-empty-media-dirs",
-                cli_help="清理本地媒体库空目录（请在无导入、转移任务时运行）",
+                cli_help=text("jobs.cleanup_empty_media_dirs.cli_help"),
+                cli_help_i18n=text_map("jobs.cleanup_empty_media_dirs.cli_help"),
                 manual_only=True,
-                handler=cleanup_empty_media_dirs,
+                handler=partial(cleanup_empty_media_dirs, i18n=context.i18n),
             ),
         ),
         extensions=(

@@ -37,6 +37,7 @@ from src.plugins.provider_protocol import (
 )
 
 from .storage import _reject_symlink_components, _root_path
+from .translations import Translator, text_map
 
 SYSTEM_TAG = "sakuramedia"
 CLIENT_TAG_PREFIX = "client:"
@@ -62,28 +63,37 @@ def _diagnostic_report(checks: list[ProviderDiagnosticCheck]) -> ProviderDiagnos
     return ProviderDiagnosticReport(status=status, checks=tuple(checks))
 
 
-def _error(
-    operation: str,
-    code: Literal[
-        "invalid_config",
-        "authentication_failed",
-        "source_not_found",
-        "task_not_managed",
-        "source_blacklisted",
-        "unsupported",
-        "unavailable",
-    ],
-    message: str,
-    *,
-    retryable: bool = False,
-) -> ProviderOperationError:
-    return ProviderOperationError(
-        provider_key="local",
-        operation=operation,
-        code=code,
-        safe_message=message,
-        retryable=retryable,
-    )
+_ErrorCode = Literal[
+    "invalid_config",
+    "authentication_failed",
+    "source_not_found",
+    "task_not_managed",
+    "source_blacklisted",
+    "unsupported",
+    "unavailable",
+]
+
+
+class _TranslatedErrors:
+    """Build locale-aware ``ProviderOperationError`` values from catalog keys."""
+
+    translations: Translator
+
+    def _error(
+        self,
+        operation: str,
+        code: _ErrorCode,
+        key: str,
+        *,
+        retryable: bool = False,
+    ) -> ProviderOperationError:
+        return ProviderOperationError(
+            provider_key="local",
+            operation=operation,
+            code=code,
+            safe_message=self.translations.t(key),
+            retryable=retryable,
+        )
 
 
 def _value(item: object, name: str, default: Any = None) -> Any:
@@ -231,13 +241,14 @@ def _torrent_hash(item: object) -> str:
     return canonical_btih(text) if text else ""
 
 
-class QbittorrentDownloadComponent:
+class QbittorrentDownloadComponent(_TranslatedErrors):
     """Declaration and construction boundary for qBittorrent downloads."""
 
     supports_torrent_bytes = True
 
-    def __init__(self, *, data_dir: Path) -> None:
+    def __init__(self, *, data_dir: Path, i18n: object | None = None) -> None:
         self.data_dir = data_dir
+        self.translations = Translator(i18n)
 
     config_fields = (
         ConfigField(
@@ -247,6 +258,9 @@ class QbittorrentDownloadComponent:
             required=True,
             description="qBittorrent WebUI 地址，后端会使用它进行连接测试和提交下载任务。",
             hint="例如 https://qb.example.com",
+            label_i18n=text_map("settings.base_url.label"),
+            description_i18n=text_map("settings.base_url.description"),
+            hint_i18n=text_map("settings.base_url.hint"),
         ),
         ConfigField(
             key="username",
@@ -254,6 +268,8 @@ class QbittorrentDownloadComponent:
             input="text",
             required=True,
             description="qBittorrent WebUI 登录用户名。",
+            label_i18n=text_map("settings.username.label"),
+            description_i18n=text_map("settings.username.description"),
         ),
         ConfigField(
             key="password",
@@ -261,6 +277,8 @@ class QbittorrentDownloadComponent:
             input="secret",
             required=True,
             description="qBittorrent WebUI 登录密码；编辑时留空表示保留已保存密码。",
+            label_i18n=text_map("settings.password.label"),
+            description_i18n=text_map("settings.password.description"),
         ),
         ConfigField(
             key="remote_save_root",
@@ -269,6 +287,9 @@ class QbittorrentDownloadComponent:
             required=True,
             description="qBittorrent 进程看到的下载根目录，例如 /downloads。",
             hint="例如 /downloads",
+            label_i18n=text_map("settings.remote_save_root.label"),
+            description_i18n=text_map("settings.remote_save_root.description"),
+            hint_i18n=text_map("settings.remote_save_root.hint"),
         ),
         ConfigField(
             key="backend_import_root_path",
@@ -277,6 +298,9 @@ class QbittorrentDownloadComponent:
             required=True,
             description="后端进程看到的同一下载根目录；必须与 qB 路径映射到同一个宿主机目录。",
             hint="例如 /mnt/qb-downloads",
+            label_i18n=text_map("settings.backend_import_root_path.label"),
+            description_i18n=text_map("settings.backend_import_root_path.description"),
+            hint_i18n=text_map("settings.backend_import_root_path.hint"),
         ),
     )
 
@@ -289,7 +313,7 @@ class QbittorrentDownloadComponent:
     ) -> JsonObject:
         del library, previous
         if not isinstance(submitted_config, dict) or set(submitted_config) != _ALLOWED_CONFIG_KEYS:
-            raise _error("prepare_client", "invalid_config", "qBittorrent 配置字段无效")
+            raise self._error("prepare_client", "invalid_config", "qb.error.invalid_config_fields")
         try:
             base_url = _normalise_base_url(submitted_config["base_url"])
             username = submitted_config["username"]
@@ -301,7 +325,7 @@ class QbittorrentDownloadComponent:
             remote_save_root = _normalise_remote_root(submitted_config["remote_save_root"])
             backend_import_root_path = str(_root_path(submitted_config["backend_import_root_path"]))
         except (OSError, TypeError, ValueError) as exc:
-            raise _error("prepare_client", "invalid_config", "qBittorrent 配置无效") from exc
+            raise self._error("prepare_client", "invalid_config", "qb.error.invalid_config") from exc
         return {
             "base_url": base_url,
             "username": username.strip(),
@@ -324,6 +348,7 @@ class QbittorrentDownloadComponent:
                     provider_config=submitted_config,
                 ),
                 data_dir=self.data_dir,
+                i18n=self.translations.i18n,
             )
             return provider.run_diagnostics()
         except ProviderOperationError as exc:
@@ -344,22 +369,33 @@ class QbittorrentDownloadComponent:
                         key="provider",
                         status="failed",
                         code="provider_test_failed",
-                        message="下载器测试失败",
+                        message=self.translations.t("qb.error.client_test_failed"),
                     )
                 ]
             )
 
     def build(self, *, client: DownloadClientHandle) -> QbittorrentDownloadProvider:
-        return QbittorrentDownloadProvider(client=client, data_dir=self.data_dir)
+        return QbittorrentDownloadProvider(
+            client=client,
+            data_dir=self.data_dir,
+            i18n=self.translations.i18n,
+        )
 
 
-class QbittorrentDownloadProvider:
-    def __init__(self, *, client: DownloadClientHandle, data_dir: Path) -> None:
+class QbittorrentDownloadProvider(_TranslatedErrors):
+    def __init__(
+        self,
+        *,
+        client: DownloadClientHandle,
+        data_dir: Path,
+        i18n: object | None = None,
+    ) -> None:
+        self.translations = Translator(i18n)
         self.client_handle = client
         self.dead_hashes_path = Path(data_dir) / f"dead-qbittorrent-{client.client_id}.json"
         config = client.provider_config
         if not isinstance(config, dict):
-            raise _error("build_download", "invalid_config", "qBittorrent 配置无效")
+            raise self._error("build_download", "invalid_config", "qb.error.invalid_config")
         try:
             self.base_url = _normalise_base_url(config.get("base_url"))
             username = config.get("username")
@@ -373,7 +409,7 @@ class QbittorrentDownloadProvider:
             self.remote_save_root = _normalise_remote_root(config.get("remote_save_root"))
             self.backend_import_root_path = str(_root_path(config.get("backend_import_root_path")))
         except (OSError, TypeError, ValueError) as exc:
-            raise _error("build_download", "invalid_config", "qBittorrent 配置无效") from exc
+            raise self._error("build_download", "invalid_config", "qb.error.invalid_config") from exc
         try:
             import qbittorrentapi
 
@@ -386,7 +422,7 @@ class QbittorrentDownloadProvider:
                 FORCE_SCHEME_FROM_HOST=True,
             )
         except Exception as exc:
-            raise _error("build_download", "unavailable", "qBittorrent 客户端不可用", retryable=True) from exc
+            raise self._error("build_download", "unavailable", "qb.error.client_unavailable", retryable=True) from exc
         self._logged_in = False
 
     def _dead_hashes(self) -> set[str]:
@@ -395,13 +431,13 @@ class QbittorrentDownloadProvider:
         except FileNotFoundError:
             return set()
         except (OSError, json.JSONDecodeError) as exc:
-            raise _error("dead_torrent_blacklist", "unavailable", "死种黑名单不可用", retryable=True) from exc
+            raise self._error("dead_torrent_blacklist", "unavailable", "qb.error.dead_blacklist_unavailable", retryable=True) from exc
         if not isinstance(raw, list):
-            raise _error("dead_torrent_blacklist", "unavailable", "死种黑名单不可用", retryable=True)
+            raise self._error("dead_torrent_blacklist", "unavailable", "qb.error.dead_blacklist_unavailable", retryable=True)
         try:
             return {canonical_btih(value) for value in raw if isinstance(value, str)}
         except ValueError as exc:
-            raise _error("dead_torrent_blacklist", "unavailable", "死种黑名单不可用", retryable=True) from exc
+            raise self._error("dead_torrent_blacklist", "unavailable", "qb.error.dead_blacklist_unavailable", retryable=True) from exc
 
     def _mark_dead(self, info_hash: str) -> None:
         hashes = self._dead_hashes()
@@ -418,7 +454,7 @@ class QbittorrentDownloadProvider:
             )
             os.replace(temporary_path, self.dead_hashes_path)
         except OSError as exc:
-            raise _error("dead_torrent_blacklist", "unavailable", "死种黑名单不可用", retryable=True) from exc
+            raise self._error("dead_torrent_blacklist", "unavailable", "qb.error.dead_blacklist_unavailable", retryable=True) from exc
 
     @staticmethod
     def _has_no_progress_for_day(item: object) -> bool:
@@ -443,7 +479,7 @@ class QbittorrentDownloadProvider:
         try:
             self.client.auth_log_in()
         except Exception as exc:
-            raise self._project_qb_error("qBittorrent_login", "qBittorrent 登录失败", exc) from exc
+            raise self._project_qb_error("qBittorrent_login", "qb.error.login_failed", exc) from exc
         self._logged_in = True
 
     @staticmethod
@@ -483,18 +519,17 @@ class QbittorrentDownloadProvider:
             }
         ) or (cls._status_code(exc) or 0) >= 500
 
-    @classmethod
     def _project_qb_error(
-        cls, operation: str, message: str, exc: Exception
+        self, operation: str, key: str, exc: Exception
     ) -> ProviderOperationError:
-        if cls._is_authentication_error(exc):
-            return _error(operation, "authentication_failed", "qBittorrent 认证失败")
-        if cls._is_retryable_error(exc):
-            return _error(operation, "unavailable", message, retryable=True)
-        status = cls._status_code(exc)
+        if self._is_authentication_error(exc):
+            return self._error(operation, "authentication_failed", "qb.error.authentication_failed")
+        if self._is_retryable_error(exc):
+            return self._error(operation, "unavailable", key, retryable=True)
+        status = self._status_code(exc)
         if status is not None and 400 <= status < 500:
-            return _error(operation, "invalid_config", "qBittorrent 请求参数无效")
-        return _error(operation, "unavailable", message, retryable=True)
+            return self._error(operation, "invalid_config", "qb.error.invalid_request")
+        return self._error(operation, "unavailable", key, retryable=True)
 
     def run_diagnostics(self) -> ProviderDiagnosticReport:
         checks: list[ProviderDiagnosticCheck] = []
@@ -517,13 +552,13 @@ class QbittorrentDownloadProvider:
                         key="directory_mapping",
                         status="skipped",
                         code="connection_failed",
-                        message="qBittorrent 连接失败，未执行目录映射测试。",
+                        message=self.translations.t("qb.diagnostic.connection_failed_mapping"),
                     ),
                     ProviderDiagnosticCheck(
                         key="hardlink",
                         status="skipped",
                         code="connection_failed",
-                        message="qBittorrent 连接失败，未执行硬链接测试。",
+                        message=self.translations.t("qb.diagnostic.connection_failed_hardlink"),
                     ),
                 )
             )
@@ -531,7 +566,7 @@ class QbittorrentDownloadProvider:
         except Exception as exc:  # noqa: BLE001 - qB API errors are provider-specific
             projected = self._project_qb_error(
                 "qBittorrent_connection",
-                "qBittorrent 连接测试失败",
+                "qb.error.connection_test_failed",
                 exc,
             )
             checks.append(
@@ -548,13 +583,13 @@ class QbittorrentDownloadProvider:
                         key="directory_mapping",
                         status="skipped",
                         code="connection_failed",
-                        message="qBittorrent 连接失败，未执行目录映射测试。",
+                        message=self.translations.t("qb.diagnostic.connection_failed_mapping"),
                     ),
                     ProviderDiagnosticCheck(
                         key="hardlink",
                         status="skipped",
                         code="connection_failed",
-                        message="qBittorrent 连接失败，未执行硬链接测试。",
+                        message=self.translations.t("qb.diagnostic.connection_failed_hardlink"),
                     ),
                 )
             )
@@ -565,7 +600,7 @@ class QbittorrentDownloadProvider:
                 key="qbittorrent_connection",
                 status="ok",
                 code="connected",
-                message="qBittorrent 连接和认证成功。",
+                message=self.translations.t("qb.diagnostic.connected"),
                 details={
                     "version": str(version) if version is not None else None,
                     "web_api_version": str(web_api_version) if web_api_version is not None else None,
@@ -590,13 +625,13 @@ class QbittorrentDownloadProvider:
                         key="directory_mapping",
                         status="failed",
                         code="invalid_media_root",
-                        message="媒体库根目录配置无效。",
+                        message=self.translations.t("qb.diagnostic.invalid_media_root"),
                     ),
                     ProviderDiagnosticCheck(
                         key="hardlink",
                         status="skipped",
                         code="mapping_failed",
-                        message="媒体库根目录无效，未执行硬链接测试。",
+                        message=self.translations.t("qb.diagnostic.media_root_invalid_hardlink"),
                     ),
                 )
             )
@@ -609,14 +644,14 @@ class QbittorrentDownloadProvider:
                         key="directory_mapping",
                         status="failed",
                         code="backend_root_not_accessible",
-                        message="后端下载根目录不存在或不是目录。",
+                        message=self.translations.t("qb.diagnostic.backend_root_missing"),
                         details={"backend_root": str(backend_root)},
                     ),
                     ProviderDiagnosticCheck(
                         key="hardlink",
                         status="skipped",
                         code="mapping_failed",
-                        message="后端下载根目录不可用，未执行硬链接测试。",
+                        message=self.translations.t("qb.diagnostic.backend_root_unavailable_hardlink"),
                     ),
                 )
             )
@@ -653,7 +688,7 @@ class QbittorrentDownloadProvider:
             except Exception as exc:  # noqa: BLE001 - qB API errors are provider-specific
                 projected = self._project_qb_error(
                     "directory_mapping",
-                    "qBittorrent 目录读取失败",
+                    "qb.error.directory_read_failed",
                     exc,
                 )
                 checks.append(
@@ -675,7 +710,7 @@ class QbittorrentDownloadProvider:
                             key="directory_mapping",
                             status="failed",
                             code="directory_mapping_mismatch",
-                            message="qBittorrent 看不到后端下载目录中的测试文件，两个路径未映射到同一目录。",
+                            message=self.translations.t("qb.diagnostic.mapping_mismatch"),
                             details={
                                 "remote_path": remote_probe_dir,
                                 "backend_path": str(backend_probe_dir),
@@ -688,7 +723,7 @@ class QbittorrentDownloadProvider:
                             key="directory_mapping",
                             status="ok",
                             code="directory_mapping_matched",
-                            message="qBittorrent 下载目录与后端下载根目录映射正确。",
+                            message=self.translations.t("qb.diagnostic.mapping_ok"),
                             details={
                                 "remote_path": remote_probe_dir,
                                 "backend_path": str(backend_probe_dir),
@@ -702,7 +737,7 @@ class QbittorrentDownloadProvider:
                         key="hardlink",
                         status="skipped",
                         code="mapping_failed",
-                        message="目录映射未通过，未执行硬链接测试。",
+                        message=self.translations.t("qb.diagnostic.mapping_failed_hardlink"),
                     )
                 )
             else:
@@ -724,7 +759,7 @@ class QbittorrentDownloadProvider:
                             key="hardlink",
                             status="ok",
                             code="hardlink_supported",
-                            message="后端下载目录与媒体库支持硬链接。",
+                            message=self.translations.t("qb.diagnostic.hardlink_ok"),
                         )
                     )
                 except (OSError, ValueError):
@@ -733,7 +768,7 @@ class QbittorrentDownloadProvider:
                             key="hardlink",
                             status="warning",
                             code="hardlink_unavailable",
-                            message="下载目录与媒体库不支持硬链接，导入时会回退为复制。",
+                            message=self.translations.t("qb.diagnostic.hardlink_unavailable"),
                         )
                     )
         except (OSError, ValueError):
@@ -742,7 +777,7 @@ class QbittorrentDownloadProvider:
                     key="directory_mapping",
                     status="failed",
                     code="diagnostic_filesystem_error",
-                    message="后端下载目录无法创建测试文件。",
+                    message=self.translations.t("qb.diagnostic.backend_write_failed"),
                 )
             )
             checks.append(
@@ -750,7 +785,7 @@ class QbittorrentDownloadProvider:
                     key="hardlink",
                     status="skipped",
                     code="mapping_failed",
-                    message="测试文件创建失败，未执行硬链接测试。",
+                    message=self.translations.t("qb.diagnostic.probe_create_failed"),
                 )
             )
         finally:
@@ -780,7 +815,7 @@ class QbittorrentDownloadProvider:
                     key="cleanup",
                     status="warning",
                     code="diagnostic_cleanup_incomplete",
-                    message="测试完成，但诊断临时文件未能全部清理。",
+                    message=self.translations.t("qb.diagnostic.cleanup_incomplete"),
                 )
             )
         return _diagnostic_report(checks)
@@ -805,8 +840,7 @@ class QbittorrentDownloadProvider:
         except Exception as exc:
             raise ValueError("invalid torrent file") from exc
 
-    @staticmethod
-    def _resolve_http_source(url: str) -> tuple[Literal["magnet", "torrent"], str | bytes]:
+    def _resolve_http_source(self, url: str) -> tuple[Literal["magnet", "torrent"], str | bytes]:
         parsed = urlsplit(url)
         if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
             raise ValueError("invalid torrent url")
@@ -818,58 +852,58 @@ class QbittorrentDownloadProvider:
                         if response.is_redirect:
                             location = response.headers.get("location")
                             if not location:
-                                raise _error("submit", "unsupported", "种子文件重定向地址无效")
+                                raise self._error("submit", "unsupported", "qb.error.redirect_location_invalid")
                             request_url = urljoin(request_url, location)
                             if _is_magnet(request_url):
                                 return "magnet", request_url
                             parsed = urlsplit(request_url)
                             if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
-                                raise _error("submit", "unsupported", "种子文件重定向地址不受支持")
+                                raise self._error("submit", "unsupported", "qb.error.redirect_unsupported")
                             continue
                         status = int(response.status_code)
                         if status == 404:
-                            raise _error("submit", "source_not_found", "种子文件不存在")
+                            raise self._error("submit", "source_not_found", "qb.error.torrent_not_found")
                         if 400 <= status < 500:
-                            raise _error("submit", "unsupported", "种子文件地址不受支持")
+                            raise self._error("submit", "unsupported", "qb.error.torrent_url_unsupported")
                         if status >= 500:
-                            raise _error(
-                                "submit", "unavailable", "种子文件服务暂时不可用", retryable=True
+                            raise self._error(
+                                "submit", "unavailable", "qb.error.torrent_service_unavailable", retryable=True
                             )
                         if not 200 <= status < 300:
-                            raise _error("submit", "unsupported", "种子文件地址不受支持")
+                            raise self._error("submit", "unsupported", "qb.error.torrent_url_unsupported")
                         content_length = response.headers.get("content-length")
                         if content_length is not None:
                             try:
                                 if int(content_length) > MAX_TORRENT_BYTES:
-                                    raise _error("submit", "unsupported", "种子文件超过大小限制")
+                                    raise self._error("submit", "unsupported", "qb.error.torrent_too_large")
                             except ValueError:
-                                raise _error("submit", "unsupported", "种子文件响应无效") from None
+                                raise self._error("submit", "unsupported", "qb.error.torrent_response_invalid") from None
                         chunks: list[bytes] = []
                         total = 0
                         for chunk in response.iter_bytes():
                             total += len(chunk)
                             if total > MAX_TORRENT_BYTES:
-                                raise _error("submit", "unsupported", "种子文件超过大小限制")
+                                raise self._error("submit", "unsupported", "qb.error.torrent_too_large")
                             chunks.append(chunk)
                         return "torrent", b"".join(chunks)
-                raise _error("submit", "unsupported", "种子文件重定向次数过多")
+                raise self._error("submit", "unsupported", "qb.error.too_many_redirects")
         except ProviderOperationError:
             raise
         except (httpx.HTTPError, OSError) as exc:
-            raise _error("submit", "unavailable", "种子文件下载失败", retryable=True) from exc
+            raise self._error("submit", "unavailable", "qb.error.torrent_download_failed", retryable=True) from exc
 
     def _source(
         self, source_uri: str, torrent_bytes: bytes | None = None
     ) -> tuple[str, Literal["magnet", "torrent"], str | bytes]:
         if torrent_bytes is not None:
             if len(torrent_bytes) > MAX_TORRENT_BYTES:
-                raise _error("submit", "unsupported", "种子文件超过大小限制")
+                raise self._error("submit", "unsupported", "qb.error.torrent_too_large")
             return self._parse_torrent_hash(torrent_bytes), "torrent", torrent_bytes
         if _is_magnet(source_uri):
             try:
                 info_hash = parse_hash_from_magnet(source_uri)
             except ValueError as exc:
-                raise _error("submit", "invalid_config", "磁力链接无效") from exc
+                raise self._error("submit", "invalid_config", "qb.error.invalid_magnet") from exc
             return info_hash, "magnet", source_uri
         try:
             source_kind, payload = self._resolve_http_source(source_uri)
@@ -879,7 +913,7 @@ class QbittorrentDownloadProvider:
         except ProviderOperationError:
             raise
         except ValueError as exc:
-            raise _error("submit", "invalid_config", "种子文件无效") from exc
+            raise self._error("submit", "invalid_config", "qb.error.invalid_torrent") from exc
 
     @staticmethod
     def _add_succeeded(response: object) -> bool:
@@ -893,14 +927,14 @@ class QbittorrentDownloadProvider:
 
     def submit(self, *, submission: DownloadSubmission) -> RemoteDownloadTask:
         if not isinstance(submission, DownloadSubmission):
-            raise _error("submit", "invalid_config", "下载提交参数无效")
+            raise self._error("submit", "invalid_config", "qb.error.invalid_submission")
         try:
             display_name = _safe_display_name(submission.display_name)
             source_uri = submission.source_uri.strip()
             if not source_uri:
                 raise ValueError("empty source")
         except (AttributeError, TypeError, ValueError) as exc:
-            raise _error("submit", "invalid_config", "下载提交参数无效") from exc
+            raise self._error("submit", "invalid_config", "qb.error.invalid_submission") from exc
         info_hash, source_kind, source_payload = self._source(
             source_uri, getattr(submission, "torrent_bytes", None)
         )
@@ -911,7 +945,7 @@ class QbittorrentDownloadProvider:
                 self.client_handle.client_id,
                 info_hash,
             )
-            raise _error("submit", "source_blacklisted", "该种子已被列入下载黑名单")
+            raise self._error("submit", "source_blacklisted", "qb.error.hash_blacklisted")
         tags = f"{SYSTEM_TAG},{CLIENT_TAG_PREFIX}{self.client_handle.client_id}"
         save_path = _remote_save_path(self.remote_save_root, display_name)
         self._login()
@@ -940,7 +974,7 @@ class QbittorrentDownloadProvider:
             elif isinstance(exc, ProviderOperationError):
                 raise
             else:
-                raise self._project_qb_error("submit", "qBittorrent 提交失败", exc) from exc
+                raise self._project_qb_error("submit", "qb.error.submit_failed", exc) from exc
         item = None
         attempts = 3 if added else 1
         for attempt in range(attempts):
@@ -949,12 +983,12 @@ class QbittorrentDownloadProvider:
                 break
             time.sleep(0.1)
         if item is None:
-            raise _error("submit", "unavailable", "qBittorrent 未返回已提交任务", retryable=True)
+            raise self._error("submit", "unavailable", "qb.error.submitted_task_missing", retryable=True)
         if not _managed(_value(item, "tags", ""), self.client_handle.client_id):
-            raise _error("submit", "task_not_managed", "同哈希下载任务已存在且不受当前客户端管理")
+            raise self._error("submit", "task_not_managed", "qb.error.existing_task_unmanaged")
         task = self._task(item)
         if task is None:
-            raise _error("submit", "unavailable", "qBittorrent 任务信息无效", retryable=True)
+            raise self._error("submit", "unavailable", "qb.error.task_invalid", retryable=True)
         return task
 
     def _completed_ref(self, item: object) -> JsonObject | None:
@@ -1006,7 +1040,7 @@ class QbittorrentDownloadProvider:
             items = self.client.torrents_info(tag=SYSTEM_TAG)
             items = tuple(items)
         except Exception as exc:
-            raise self._project_qb_error("list_tasks", "qBittorrent 任务读取失败", exc) from exc
+            raise self._project_qb_error("list_tasks", "qb.error.task_read_failed", exc) from exc
         result: list[RemoteDownloadTask] = []
         for item in items:
             if not _managed(_value(item, "tags", ""), self.client_handle.client_id):
@@ -1055,17 +1089,17 @@ class QbittorrentDownloadProvider:
         except Exception as exc:
             if self._is_missing(exc):
                 return None
-            raise self._project_qb_error(operation, "qBittorrent 任务读取失败", exc) from exc
+            raise self._project_qb_error(operation, "qb.error.task_read_failed", exc) from exc
         return next(iter(items), None)
 
     def delete_task(self, *, remote_id: str, delete_files: bool) -> None:
         if not isinstance(remote_id, str) or not remote_id.strip() or not isinstance(delete_files, bool):
-            raise _error("delete_task", "invalid_config", "下载任务参数无效")
+            raise self._error("delete_task", "invalid_config", "qb.error.invalid_task_params")
         remote_id = remote_id.strip()
         self._login()
         item = self._find(remote_id, operation="delete_task")
         if item is not None and not _managed(_value(item, "tags", ""), self.client_handle.client_id):
-            raise _error("delete_task", "task_not_managed", "下载任务不受当前客户端管理")
+            raise self._error("delete_task", "task_not_managed", "qb.error.task_not_managed")
         shell = (
             self._backend_path_for_save_path(_value(item, "save_path", ""))
             if item is not None
@@ -1079,7 +1113,7 @@ class QbittorrentDownloadProvider:
                 )
             except Exception as exc:
                 if not self._is_missing(exc):
-                    raise self._project_qb_error("delete_task", "qBittorrent 删除任务失败", exc) from exc
+                    raise self._project_qb_error("delete_task", "qb.error.delete_task_failed", exc) from exc
         if delete_files:
             self._remove_task_directories(remote_id, preferred=shell)
 

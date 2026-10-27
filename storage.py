@@ -47,6 +47,7 @@ from src.plugins.provider_protocol import (
 from src.service.playback.media_metadata_probe_service import MediaMetadataProbeService
 
 from .merged_playback import Mp4MergeError, build_layout, merged_range_requests_response
+from .translations import Translator
 
 logger = logging.getLogger(__name__)
 
@@ -92,28 +93,37 @@ _VIDEO_SUFFIXES = frozenset(
 )
 
 
-def _provider_error(
-    operation: str,
-    code: Literal[
-        "invalid_config",
-        "authentication_failed",
-        "source_not_found",
-        "unsupported",
-        "unavailable",
-    ],
-    safe_message: str,
-    *,
-    retryable: bool = False,
-) -> ProviderOperationError:
-    # Keep user supplied paths and subprocess/decoder details out of the
-    # message.  They may contain absolute paths or other sensitive details.
-    return ProviderOperationError(
-        provider_key="local",
-        operation=operation,
-        code=code,
-        safe_message=safe_message,
-        retryable=retryable,
-    )
+_ErrorCode = Literal[
+    "invalid_config",
+    "authentication_failed",
+    "source_not_found",
+    "unsupported",
+    "unavailable",
+]
+
+
+class _TranslatedErrors:
+    """Build locale-aware ``ProviderOperationError`` values from catalog keys."""
+
+    translations: Translator
+
+    def _error(
+        self,
+        operation: str,
+        code: _ErrorCode,
+        key: str,
+        *,
+        retryable: bool = False,
+    ) -> ProviderOperationError:
+        # Keep user supplied paths and subprocess/decoder details out of the
+        # message.  They may contain absolute paths or other sensitive details.
+        return ProviderOperationError(
+            provider_key="local",
+            operation=operation,
+            code=code,
+            safe_message=self.translations.t(key),
+            retryable=retryable,
+        )
 
 
 def _staged_media(
@@ -161,11 +171,12 @@ class _TransferFileSnapshot:
         )
 
 
-class _LocalTransferReader:
+class _LocalTransferReader(_TranslatedErrors):
     """Independent logical cursor over a source-owned stable file descriptor."""
 
     def __init__(self, source: _LocalTransferSource) -> None:
         self._source = source
+        self.translations = source.translations
         self._position = 0
         self._closed = False
 
@@ -186,8 +197,8 @@ class _LocalTransferReader:
         try:
             data = os.pread(self._source._fd, size, self._position)
         except OSError as exc:
-            raise _provider_error(
-                "open_transfer_source", "unavailable", "媒体文件读取失败", retryable=True
+            raise self._error(
+                "open_transfer_source", "unavailable", "storage.error.media_read_failed", retryable=True
             ) from exc
         self._position += len(data)
         return data
@@ -215,15 +226,25 @@ class _LocalTransferReader:
         self._source._ensure_open()
 
 
-class _LocalTransferSource:
+class _LocalTransferSource(_TranslatedErrors):
     """Provider-private stable descriptor and the path snapshot it represents."""
 
-    def __init__(self, *, owner: object, media: MediaHandle, path: Path, fd: int, snapshot: _TransferFileSnapshot) -> None:
+    def __init__(
+        self,
+        *,
+        owner: object,
+        media: MediaHandle,
+        path: Path,
+        fd: int,
+        snapshot: _TransferFileSnapshot,
+        translations: Translator,
+    ) -> None:
         self._owner = owner
         self._media = media
         self._path = path
         self._fd = fd
         self._snapshot = snapshot
+        self.translations = translations
         self.info = MediaTransferSourceInfo(file_name=path.name, size_bytes=snapshot.size)
         self._closed = False
 
@@ -241,25 +262,25 @@ class _LocalTransferSource:
         try:
             descriptor = os.fstat(self._fd)
         except OSError as exc:
-            raise _provider_error(
-                "open_transfer_source", "unavailable", "媒体文件读取失败", retryable=True
+            raise self._error(
+                "open_transfer_source", "unavailable", "storage.error.media_read_failed", retryable=True
             ) from exc
         if not stat.S_ISREG(descriptor.st_mode) or (
             _TransferFileSnapshot.from_stat(descriptor) != self._snapshot
         ):
-            raise _provider_error("open_transfer_source", "source_not_found", "媒体文件已变化")
+            raise self._error("open_transfer_source", "source_not_found", "storage.error.media_changed")
         try:
             current = os.stat(self._path, follow_symlinks=False)
         except FileNotFoundError as exc:
-            raise _provider_error("open_transfer_source", "source_not_found", "媒体文件已变化") from exc
+            raise self._error("open_transfer_source", "source_not_found", "storage.error.media_changed") from exc
         except OSError as exc:
-            raise _provider_error(
-                "open_transfer_source", "unavailable", "媒体文件读取失败", retryable=True
+            raise self._error(
+                "open_transfer_source", "unavailable", "storage.error.media_read_failed", retryable=True
             ) from exc
         if not stat.S_ISREG(current.st_mode) or (
             _TransferFileSnapshot.from_stat(current) != self._snapshot
         ):
-            raise _provider_error("open_transfer_source", "source_not_found", "媒体文件已变化")
+            raise self._error("open_transfer_source", "source_not_found", "storage.error.media_changed")
 
     def _close(self) -> None:
         if self._closed:
@@ -326,15 +347,16 @@ def _ensure_under(path: Path, root: Path) -> None:
         raise ValueError("path escapes root") from exc
 
 
-class LocalStorageProvider:
+class LocalStorageProvider(_TranslatedErrors):
     """A provider-neutral local filesystem storage implementation."""
 
     supports_in_place_import = True
 
-    def __init__(self, *, library: LibraryHandle, data_dir: Path):
+    def __init__(self, *, library: LibraryHandle, data_dir: Path, i18n: object | None = None):
+        self.translations = Translator(i18n)
         config = library.provider_config
         if not isinstance(config, dict):
-            raise _provider_error("build_storage", "invalid_config", "本地存储配置无效")
+            raise self._error("build_storage", "invalid_config", "storage.error.invalid_config")
         try:
             self.media_root = _root_path(config.get("media_root_path"))
             self.manual_import_root = _root_path(config.get("manual_import_root_path"))
@@ -342,7 +364,7 @@ class LocalStorageProvider:
             self.operation_dir = self.data_dir / "operations"
             _reject_symlink_components(self.operation_dir, include_leaf=False)
         except (ValueError, OSError) as exc:
-            raise _provider_error("build_storage", "invalid_config", "本地存储路径配置无效") from exc
+            raise self._error("build_storage", "invalid_config", "storage.error.invalid_library_path") from exc
         try:
             self.media_root.mkdir(parents=True, exist_ok=True)
             self.manual_import_root.mkdir(parents=True, exist_ok=True)
@@ -353,8 +375,8 @@ class LocalStorageProvider:
             _reject_symlink_components(self.data_dir)
             _reject_symlink_components(self.operation_dir)
         except (OSError, ValueError) as exc:
-            raise _provider_error(
-                "build_storage", "unavailable", "本地存储目录不可用", retryable=True
+            raise self._error(
+                "build_storage", "unavailable", "storage.error.storage_unavailable", retryable=True
             ) from exc
 
     @staticmethod
@@ -378,16 +400,15 @@ class LocalStorageProvider:
     def _is_in_place_ref(ref: object) -> bool:
         return isinstance(ref, dict) and ref.get("kind") == IN_PLACE_MEDIA_REF_KIND
 
-    @staticmethod
-    def _identity_from_ref(ref: object, *, operation: str) -> dict[str, int]:
+    def _identity_from_ref(self, ref: object, *, operation: str) -> dict[str, int]:
         if not isinstance(ref, dict):
-            raise _provider_error(operation, "source_not_found", "本地媒体引用无效")
+            raise self._error(operation, "source_not_found", "storage.error.invalid_media_ref")
         identity = {key: ref.get(key) for key in _IN_PLACE_IDENTITY_FIELDS}
         if not all(
             isinstance(value, int) and not isinstance(value, bool)
             for value in identity.values()
         ):
-            raise _provider_error(operation, "source_not_found", "本地媒体引用无效")
+            raise self._error(operation, "source_not_found", "storage.error.invalid_media_ref")
         return identity
 
     def get_space_usage(self) -> StorageSpaceUsage:
@@ -395,8 +416,8 @@ class LocalStorageProvider:
             _reject_symlink_components(self.media_root)
             usage = shutil.disk_usage(self.media_root)
         except (OSError, ValueError) as exc:
-            raise _provider_error(
-                "get_space_usage", "unavailable", "本地存储空间读取失败", retryable=True
+            raise self._error(
+                "get_space_usage", "unavailable", "storage.error.space_usage_failed", retryable=True
             ) from exc
         return StorageSpaceUsage(
             total_bytes=usage.total,
@@ -411,10 +432,10 @@ class LocalStorageProvider:
             media_root = self.media_root.resolve(strict=False)
             candidates = list(self.media_root.rglob("*"))
         except (OSError, ValueError) as exc:
-            raise _provider_error(
+            raise self._error(
                 "scan_managed_media_ref_keys",
                 "unavailable",
-                "本地媒体目录读取失败",
+                "storage.error.media_directory_read_failed",
                 retryable=True,
             ) from exc
         keys: set[str] = set()
@@ -428,10 +449,10 @@ class LocalStorageProvider:
             except ValueError:
                 continue
             except OSError as exc:
-                raise _provider_error(
+                raise self._error(
                     "scan_managed_media_ref_keys",
                     "unavailable",
-                    "本地媒体文件读取失败",
+                    "storage.error.media_file_read_failed",
                     retryable=True,
                 ) from exc
             keys.add(relative_path)
@@ -444,10 +465,10 @@ class LocalStorageProvider:
             manual_import_root = self.manual_import_root.resolve(strict=False)
             candidates = list(self.manual_import_root.rglob("*"))
         except (OSError, ValueError) as exc:
-            raise _provider_error(
+            raise self._error(
                 "scan_managed_media_ref_keys",
                 "unavailable",
-                "本地导入目录读取失败",
+                "storage.error.import_directory_read_failed",
                 retryable=True,
             ) from exc
         keys: set[str] = set()
@@ -462,10 +483,10 @@ class LocalStorageProvider:
             except ValueError:
                 continue
             except OSError as exc:
-                raise _provider_error(
+                raise self._error(
                     "scan_managed_media_ref_keys",
                     "unavailable",
-                    "本地导入文件读取失败",
+                    "storage.error.import_file_read_failed",
                     retryable=True,
                 ) from exc
             keys.add(self._in_place_key(relative_path, identity))
@@ -481,32 +502,31 @@ class LocalStorageProvider:
             identity["source_mtime_ns"],
         )
 
-    @staticmethod
-    def managed_media_ref_key(*, media_ref: JsonObject) -> str:
+    def managed_media_ref_key(self, *, media_ref: JsonObject) -> str:
         if not isinstance(media_ref, dict) or media_ref.get("version") != LOCAL_REF_VERSION:
-            raise _provider_error(
+            raise self._error(
                 "managed_media_ref_key",
                 "source_not_found",
-                "本地媒体引用无效",
+                "storage.error.invalid_media_ref",
             )
         kind = media_ref.get("kind")
         if kind not in {MEDIA_REF_KIND, IN_PLACE_MEDIA_REF_KIND}:
-            raise _provider_error(
+            raise self._error(
                 "managed_media_ref_key",
                 "source_not_found",
-                "本地媒体引用无效",
+                "storage.error.invalid_media_ref",
             )
         try:
             relative = "/".join(_relative_parts(media_ref.get("relative_path")))
         except ValueError as exc:
-            raise _provider_error(
+            raise self._error(
                 "managed_media_ref_key",
                 "source_not_found",
-                "本地媒体引用无效",
+                "storage.error.invalid_media_ref",
             ) from exc
         if kind == MEDIA_REF_KIND:
             return relative
-        identity = LocalStorageProvider._identity_from_ref(
+        identity = self._identity_from_ref(
             media_ref, operation="managed_media_ref_key"
         )
         return LocalStorageProvider._in_place_key(relative, identity)
@@ -529,9 +549,9 @@ class LocalStorageProvider:
         expected_kind: str = MEDIA_REF_KIND,
     ) -> tuple[Path, str]:
         if not isinstance(ref, dict):
-            raise _provider_error(operation, "source_not_found", "本地引用无效")
+            raise self._error(operation, "source_not_found", "storage.error.invalid_ref")
         if ref.get("version") != LOCAL_REF_VERSION or ref.get("kind") != expected_kind:
-            raise _provider_error(operation, "source_not_found", "本地引用无效")
+            raise self._error(operation, "source_not_found", "storage.error.invalid_ref")
         try:
             parts = _relative_parts(ref.get("relative_path"), allow_empty=True)
             path = root.joinpath(*parts)
@@ -539,11 +559,11 @@ class LocalStorageProvider:
             resolved = path.resolve(strict=False)
             _ensure_under(resolved, root.resolve(strict=False))
         except (ValueError, OSError) as exc:
-            raise _provider_error(operation, "source_not_found", "本地引用不可访问") from exc
+            raise self._error(operation, "source_not_found", "storage.error.ref_inaccessible") from exc
         if require_file is True and (not path.is_file() or path.is_symlink()):
-            raise _provider_error(operation, "source_not_found", "媒体文件不存在")
+            raise self._error(operation, "source_not_found", "storage.error.media_not_found")
         if require_file is False and (not path.is_dir() or path.is_symlink()):
-            raise _provider_error(operation, "source_not_found", "目录不存在")
+            raise self._error(operation, "source_not_found", "storage.error.directory_not_found")
         return path, "/".join(parts)
 
     def _source_root_for_ref(
@@ -553,9 +573,9 @@ class LocalStorageProvider:
         operation: str,
     ) -> tuple[Path, str]:
         if not isinstance(source_ref, dict):
-            raise _provider_error(operation, "source_not_found", "本地导入引用无效")
+            raise self._error(operation, "source_not_found", "storage.error.invalid_import_ref")
         if source_ref.get("version") != LOCAL_REF_VERSION:
-            raise _provider_error(operation, "source_not_found", "本地导入引用无效")
+            raise self._error(operation, "source_not_found", "storage.error.invalid_import_ref")
         kind = source_ref.get("kind")
         if kind == MANUAL_SOURCE_REF_KIND:
             return self.manual_import_root, MANUAL_SOURCE_REF_KIND
@@ -563,8 +583,8 @@ class LocalStorageProvider:
             try:
                 return _root_path(source_ref.get("root_path")), DOWNLOAD_SOURCE_REF_KIND
             except (OSError, ValueError) as exc:
-                raise _provider_error(operation, "source_not_found", "下载导入根目录无效") from exc
-        raise _provider_error(operation, "source_not_found", "本地导入引用无效")
+                raise self._error(operation, "source_not_found", "storage.error.invalid_download_root") from exc
+        raise self._error(operation, "source_not_found", "storage.error.invalid_import_ref")
 
     @staticmethod
     def _source_ref_with_relative(source_ref: JsonObject, relative_path: str) -> JsonObject:
@@ -581,7 +601,7 @@ class LocalStorageProvider:
         try:
             stat = path.stat()
         except OSError as exc:
-            raise _provider_error("browse", "unavailable", "本地目录读取失败", retryable=True) from exc
+            raise self._error("browse", "unavailable", "storage.error.directory_read_failed", retryable=True) from exc
         modified_at = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
         return BrowseEntry(
             source_ref=self._manual_source_ref(relative_path),
@@ -596,7 +616,7 @@ class LocalStorageProvider:
         self, *, parent_ref: JsonObject | None, cursor: str | None, limit: int
     ) -> BrowsePage:
         if not isinstance(limit, int) or not 1 <= limit <= 200:
-            raise _provider_error("browse", "invalid_config", "浏览分页参数无效")
+            raise self._error("browse", "invalid_config", "storage.error.invalid_browse_limit")
         parent_path, parent_relative = (
             (self.manual_import_root, "")
             if parent_ref is None
@@ -613,7 +633,7 @@ class LocalStorageProvider:
             if offset < 0:
                 raise ValueError
         except (TypeError, ValueError) as exc:
-            raise _provider_error("browse", "invalid_config", "浏览游标无效") from exc
+            raise self._error("browse", "invalid_config", "storage.error.invalid_browse_cursor") from exc
         try:
             children = []
             for child in parent_path.iterdir():
@@ -623,7 +643,7 @@ class LocalStorageProvider:
                 relative = "/".join(filter(None, (parent_relative, child.name)))
                 children.append((child.name.casefold(), child.name, self._entry(child, relative_path=relative)))
         except OSError as exc:
-            raise _provider_error("browse", "unavailable", "本地目录读取失败", retryable=True) from exc
+            raise self._error("browse", "unavailable", "storage.error.directory_read_failed", retryable=True) from exc
         children.sort(key=lambda item: (item[0], item[1]))
         page = children[offset : offset + limit]
         next_cursor = str(offset + limit) if offset + limit < len(children) else None
@@ -644,15 +664,12 @@ class LocalStorageProvider:
             expected_kind=source_kind,
         )
         if not source_path.exists() or not (source_path.is_file() or source_path.is_dir()):
-            raise _provider_error("scan_import_source", "source_not_found", "扫描目录不存在")
+            raise self._error("scan_import_source", "source_not_found", "storage.error.scan_root_not_found")
         last_report = last_log = float("-inf")
 
-        def report(stage, current, total, *, force=False):
+        def emit(text, current, total, *, force=False):
             nonlocal last_report, last_log
             now = time.monotonic()
-            text = f"{stage} · 已检查 {current} 个条目"
-            if total > 0:
-                text = f"{stage} · 已处理 {current}/{total} 个条目"
             if force or now - last_log >= 10:
                 logger.info("本地导入扫描进度 %s", text)
                 last_log = now
@@ -660,23 +677,34 @@ class LocalStorageProvider:
                 progress_callback({"current": current, "total": total, "text": text})
                 last_report = now
 
-        report("枚举本地目录", 0, 0, force=True)
+        def report(stage_key, current, total, *, force=False):
+            text = self.translations.t(
+                "storage.progress.entries_processed"
+                if total > 0
+                else "storage.progress.entries_checked",
+                stage=self.translations.t(stage_key),
+                current=current,
+                total=total,
+            )
+            emit(text, current, total, force=force)
+
+        report("storage.progress.stage.enumerating", 0, 0, force=True)
         try:
             candidates = []
             entries = (source_path,) if source_path.is_file() else source_path.rglob("*")
             for candidate in entries:
                 candidates.append(candidate)
-                report("枚举本地目录", len(candidates), 0)
+                report("storage.progress.stage.enumerating", len(candidates), 0)
         except OSError as exc:
-            raise _provider_error(
-                "scan_import_source", "unavailable", "本地目录扫描失败", retryable=True
+            raise self._error(
+                "scan_import_source", "unavailable", "storage.error.scan_failed", retryable=True
             ) from exc
         total = len(candidates)
-        report("本地目录枚举完成", total, total, force=True)
-        report("检查本地文件", 0, total, force=True)
+        report("storage.progress.stage.enumeration_done", total, total, force=True)
+        report("storage.progress.stage.checking_files", 0, total, force=True)
         result: list[ImportFile] = []
         for index, candidate in enumerate(candidates):
-            report("检查本地文件", index, total)
+            report("storage.progress.stage.checking_files", index, total)
             try:
                 if candidate.is_symlink() or not candidate.is_file():
                     continue
@@ -688,8 +716,8 @@ class LocalStorageProvider:
             except (OSError, ValueError) as exc:
                 if isinstance(exc, ValueError):
                     continue
-                raise _provider_error(
-                    "scan_import_source", "unavailable", "本地文件读取失败", retryable=True
+                raise self._error(
+                    "scan_import_source", "unavailable", "storage.error.file_read_failed", retryable=True
                 ) from exc
             result.append(
                 ImportFile(
@@ -701,7 +729,12 @@ class LocalStorageProvider:
                 )
             )
         result.sort(key=lambda item: (item.relative_path.casefold(), item.relative_path))
-        report(f"本地扫描完成 · 发现 {len(result)} 个文件", total, total, force=True)
+        emit(
+            self.translations.t("storage.progress.scan_done", count=len(result)),
+            total,
+            total,
+            force=True,
+        )
         return tuple(result)
 
     @staticmethod
@@ -735,17 +768,17 @@ class LocalStorageProvider:
             source_resolved = source_path.resolve(strict=False)
             media_resolved = self.media_root.resolve(strict=False)
         except (OSError, RuntimeError) as exc:
-            raise _provider_error(
+            raise self._error(
                 operation,
                 "unavailable",
-                "导入源路径不可用，请稍后重试",
+                "storage.error.import_source_unavailable_retry",
                 retryable=True,
             ) from exc
         if self._paths_overlap(source_resolved, media_resolved):
-            raise _provider_error(
+            raise self._error(
                 operation,
                 "invalid_config",
-                "导入源与媒体库目录重叠，请选择媒体库目录之外的位置",
+                "storage.error.import_source_overlaps_library",
             )
 
     def get_import_source_identity(self, *, source: ImportFile) -> str:
@@ -765,8 +798,8 @@ class LocalStorageProvider:
             if len(content) != identity["source_size"]:
                 raise OSError("source changed during read")
         except OSError as exc:
-            raise _provider_error(
-                "read_import_file", "unavailable", "导入源读取失败", retryable=True
+            raise self._error(
+                "read_import_file", "unavailable", "storage.error.import_source_read_failed", retryable=True
             ) from exc
         return ImportFileContent(
             content=content,
@@ -785,20 +818,20 @@ class LocalStorageProvider:
         except ValueError:
             return
         except OSError as exc:
-            raise _provider_error(
-                operation, "unavailable", "导入源路径不可用", retryable=True
+            raise self._error(
+                operation, "unavailable", "storage.error.import_source_unavailable", retryable=True
             ) from exc
-        raise _provider_error(
+        raise self._error(
             operation,
             "unsupported",
-            "不允许删除媒体库内的导入源",
+            "storage.error.import_source_inside_library",
         )
 
     def delete_import_file(self, *, receipt: JsonObject) -> None:
         if not isinstance(receipt, dict):
-            raise _provider_error("delete_import_file", "source_not_found", "导入源引用无效")
+            raise self._error("delete_import_file", "source_not_found", "storage.error.invalid_import_source_ref")
         if receipt.get("version") != LOCAL_REF_VERSION or receipt.get("kind") != "local_import_file":
-            raise _provider_error("delete_import_file", "source_not_found", "导入源引用无效")
+            raise self._error("delete_import_file", "source_not_found", "storage.error.invalid_import_source_ref")
         source_ref = receipt.get("source_ref")
         source_root, source_kind = self._source_root_for_ref(
             source_ref,
@@ -812,13 +845,13 @@ class LocalStorageProvider:
             expected_kind=source_kind,
         )
         if receipt.get("source_relative_path") != relative:
-            raise _provider_error("delete_import_file", "source_not_found", "导入源引用无效")
+            raise self._error("delete_import_file", "source_not_found", "storage.error.invalid_import_source_ref")
         identity = {
             key: receipt.get(key)
             for key in ("source_dev", "source_ino", "source_size", "source_mtime_ns")
         }
         if not all(isinstance(value, int) for value in identity.values()):
-            raise _provider_error("delete_import_file", "source_not_found", "导入源引用无效")
+            raise self._error("delete_import_file", "source_not_found", "storage.error.invalid_import_source_ref")
         self._reject_media_library_source(source, operation="delete_import_file")
         try:
             _reject_symlink_components(source)
@@ -826,12 +859,12 @@ class LocalStorageProvider:
                 raise ValueError("source changed")
             source.unlink()
         except ValueError as exc:
-            raise _provider_error(
-                "delete_import_file", "source_not_found", "导入源已变化，未删除"
+            raise self._error(
+                "delete_import_file", "source_not_found", "storage.error.import_source_changed"
             ) from exc
         except OSError as exc:
-            raise _provider_error(
-                "delete_import_file", "unavailable", "导入源删除失败", retryable=True
+            raise self._error(
+                "delete_import_file", "unavailable", "storage.error.import_source_delete_failed", retryable=True
             ) from exc
 
     @staticmethod
@@ -873,12 +906,11 @@ class LocalStorageProvider:
             for key in ("source_dev", "source_ino", "source_size", "source_mtime_ns")
         )
 
-    @staticmethod
-    def _safe_relative(value: object, *, operation: str) -> str:
+    def _safe_relative(self, value: object, *, operation: str) -> str:
         try:
             return "/".join(_relative_parts(value))
         except ValueError as exc:
-            raise _provider_error(operation, "source_not_found", "导入操作记录无效") from exc
+            raise self._error(operation, "source_not_found", "storage.error.invalid_operation_journal") from exc
 
     def _target_from_journal(self, journal: dict[str, Any], *, operation: str) -> Path:
         relative = self._safe_relative(journal.get("target_relative_path"), operation=operation)
@@ -894,7 +926,7 @@ class LocalStorageProvider:
             _reject_symlink_components(path, include_leaf=False)
             _ensure_under(path.resolve(strict=False), self.media_root.resolve(strict=False))
         except (KeyError, TypeError, ValueError, OSError) as exc:
-            raise _provider_error(operation, "source_not_found", "导入操作记录无效") from exc
+            raise self._error(operation, "source_not_found", "storage.error.invalid_operation_journal") from exc
         return path
 
     def _temporary_from_journal(self, journal: dict[str, Any], *, operation: str) -> Path:
@@ -907,7 +939,7 @@ class LocalStorageProvider:
             _reject_symlink_components(path, include_leaf=False)
             _ensure_under(path.resolve(strict=False), self.media_root.resolve(strict=False))
         except (OSError, ValueError) as exc:
-            raise _provider_error(operation, "source_not_found", "导入操作记录无效") from exc
+            raise self._error(operation, "source_not_found", "storage.error.invalid_operation_journal") from exc
         return path
 
     def _read_journal(self, operation_key: str, *, operation: str) -> dict[str, Any]:
@@ -916,17 +948,17 @@ class LocalStorageProvider:
             with path.open("r", encoding="utf-8") as handle:
                 journal = json.load(handle)
         except (FileNotFoundError, ValueError) as exc:
-            raise _provider_error(operation, "source_not_found", "导入回执无效") from exc
+            raise self._error(operation, "source_not_found", "storage.error.invalid_receipt") from exc
         except OSError as exc:
-            raise _provider_error(operation, "unavailable", "导入操作记录不可读", retryable=True) from exc
+            raise self._error(operation, "unavailable", "storage.error.journal_unreadable", retryable=True) from exc
         if not isinstance(journal, dict):
-            raise _provider_error(operation, "source_not_found", "导入操作记录无效")
+            raise self._error(operation, "source_not_found", "storage.error.invalid_operation_journal")
         if journal.get("version") != LOCAL_REF_VERSION or journal.get("kind") != _OPERATION_KIND:
-            raise _provider_error(operation, "source_not_found", "导入操作记录无效")
+            raise self._error(operation, "source_not_found", "storage.error.invalid_operation_journal")
         if journal.get("operation_key") != operation_key:
-            raise _provider_error(operation, "source_not_found", "导入操作记录无效")
+            raise self._error(operation, "source_not_found", "storage.error.invalid_operation_journal")
         if not isinstance(journal.get("token"), str) or not journal["token"]:
-            raise _provider_error(operation, "source_not_found", "导入操作记录无效")
+            raise self._error(operation, "source_not_found", "storage.error.invalid_operation_journal")
         state = journal.get("state")
         if state not in {
             _OPERATION_STATE_PREPARING,
@@ -934,7 +966,7 @@ class LocalStorageProvider:
             _OPERATION_STATE_FINALIZED,
             _OPERATION_STATE_ABORTED,
         }:
-            raise _provider_error(operation, "source_not_found", "导入操作记录无效")
+            raise self._error(operation, "source_not_found", "storage.error.invalid_operation_journal")
         source_ref = journal.get("source_ref")
         source_root, source_kind = self._source_root_for_ref(source_ref, operation=operation)
         _source_path, source_relative = self._path_from_ref(
@@ -944,19 +976,19 @@ class LocalStorageProvider:
             expected_kind=source_kind,
         )
         if journal.get("source_relative_path") != source_relative:
-            raise _provider_error(operation, "source_not_found", "导入操作记录无效")
+            raise self._error(operation, "source_not_found", "storage.error.invalid_operation_journal")
         self._safe_relative(journal.get("placement_relative_path"), operation=operation)
         self._safe_relative(journal.get("target_relative_path"), operation=operation)
         self._safe_relative(journal.get("temp_relative_path"), operation=operation)
         if journal.get("source_disposition") not in {"keep", "delete_after_commit"}:
-            raise _provider_error(operation, "source_not_found", "导入操作记录无效")
+            raise self._error(operation, "source_not_found", "storage.error.invalid_operation_journal")
         integer_fields = ["source_dev", "source_ino", "source_size", "source_mtime_ns"]
         if state != _OPERATION_STATE_PREPARING:
             integer_fields.extend(
                 ["target_size", "target_dev", "target_ino", "target_mtime_ns"]
             )
         if any(not isinstance(journal.get(field), int) for field in integer_fields):
-            raise _provider_error(operation, "source_not_found", "导入操作记录无效")
+            raise self._error(operation, "source_not_found", "storage.error.invalid_operation_journal")
         self._temporary_from_journal(journal, operation=operation)
         return journal
 
@@ -974,20 +1006,20 @@ class LocalStorageProvider:
             finally:
                 temporary.unlink(missing_ok=True)
         except (KeyError, OSError, TypeError, ValueError) as exc:
-            raise _provider_error(operation, "unavailable", "导入操作记录写入失败", retryable=True) from exc
+            raise self._error(operation, "unavailable", "storage.error.journal_write_failed", retryable=True) from exc
 
     def _receipt_journal(self, receipt: object, *, operation: str) -> dict[str, Any]:
         if not isinstance(receipt, dict) or set(receipt) != {"operation_key", "token"}:
-            raise _provider_error(operation, "source_not_found", "导入回执无效")
+            raise self._error(operation, "source_not_found", "storage.error.invalid_receipt")
         operation_key = receipt.get("operation_key")
         token = receipt.get("token")
         if not isinstance(operation_key, str) or not isinstance(token, str) or not token:
-            raise _provider_error(operation, "source_not_found", "导入回执无效")
+            raise self._error(operation, "source_not_found", "storage.error.invalid_receipt")
         journal = self._read_journal(operation_key, operation=operation)
         if not secrets.compare_digest(token, journal["token"]):
-            raise _provider_error(operation, "source_not_found", "导入回执无效")
+            raise self._error(operation, "source_not_found", "storage.error.invalid_receipt")
         if journal["state"] == _OPERATION_STATE_PREPARING:
-            raise _provider_error(operation, "unavailable", "导入仍在准备中", retryable=True)
+            raise self._error(operation, "unavailable", "storage.error.import_preparing", retryable=True)
         self._target_from_journal(journal, operation=operation)
         return journal
 
@@ -997,13 +1029,13 @@ class LocalStorageProvider:
                 raise ValueError("target is not a regular file")
             stat = target.stat()
         except (OSError, ValueError) as exc:
-            raise _provider_error(operation, "source_not_found", "导入目标文件不存在") from exc
+            raise self._error(operation, "source_not_found", "storage.error.target_not_found") from exc
         if stat.st_size != journal["target_size"]:
-            raise _provider_error(operation, "source_not_found", "导入目标文件不完整")
+            raise self._error(operation, "source_not_found", "storage.error.target_incomplete")
         if stat.st_dev != journal["target_dev"] or stat.st_ino != journal["target_ino"]:
-            raise _provider_error(operation, "source_not_found", "导入目标文件已被替换")
+            raise self._error(operation, "source_not_found", "storage.error.target_replaced")
         if stat.st_mtime_ns != journal["target_mtime_ns"]:
-            raise _provider_error(operation, "source_not_found", "导入目标文件已被替换")
+            raise self._error(operation, "source_not_found", "storage.error.target_replaced")
 
     @staticmethod
     def _placement_parts(placement: object) -> tuple[str, ...]:
@@ -1028,12 +1060,12 @@ class LocalStorageProvider:
             _reject_symlink_components(target, include_leaf=False)
             _ensure_under(target.resolve(strict=False), self.media_root.resolve(strict=False))
         except (ValueError, OSError) as exc:
-            raise _provider_error("stage_import_file", "invalid_config", "导入目标路径无效") from exc
+            raise self._error("stage_import_file", "invalid_config", "storage.error.invalid_target_path") from exc
         return target, target_relative
 
     def _source_for(self, source: object) -> tuple[Path, str, dict[str, int]]:
         if not isinstance(source, ImportFile):
-            raise _provider_error("stage_import_file", "source_not_found", "导入源无效")
+            raise self._error("stage_import_file", "source_not_found", "storage.error.invalid_source")
         source_root, source_kind = self._source_root_for_ref(
             source.source_ref,
             operation="stage_import_file",
@@ -1048,13 +1080,13 @@ class LocalStorageProvider:
         try:
             source_parts = _relative_parts(source.relative_path)
         except ValueError as exc:
-            raise _provider_error("stage_import_file", "source_not_found", "导入源无效") from exc
+            raise self._error("stage_import_file", "source_not_found", "storage.error.invalid_source") from exc
         if "/".join(source_parts) != relative or source.name != path.name:
-            raise _provider_error("stage_import_file", "source_not_found", "导入源无效")
+            raise self._error("stage_import_file", "source_not_found", "storage.error.invalid_source")
         try:
             return path, relative, self._source_identity(path)
         except OSError as exc:
-            raise _provider_error("stage_import_file", "unavailable", "导入源读取失败", retryable=True) from exc
+            raise self._error("stage_import_file", "unavailable", "storage.error.import_source_read_failed", retryable=True) from exc
 
     def _stage_in_place(
         self,
@@ -1069,7 +1101,7 @@ class LocalStorageProvider:
         operation = "stage_import_file"
         _, source_kind = self._source_root_for_ref(source.source_ref, operation=operation)
         if source_kind != MANUAL_SOURCE_REF_KIND:
-            raise _provider_error(operation, "unsupported", "原地导入仅支持手动导入目录")
+            raise self._error(operation, "unsupported", "storage.error.in_place_manual_only")
         return _staged_media(
             storage_ref=self._in_place_ref(source_relative, source_identity),
             receipt={
@@ -1087,11 +1119,11 @@ class LocalStorageProvider:
 
     def _in_place_receipt_path(self, receipt: object, *, operation: str) -> Path:
         if not isinstance(receipt, dict) or receipt.get("kind") != _IN_PLACE_RECEIPT_KIND:
-            raise _provider_error(operation, "source_not_found", "原地导入回执无效")
+            raise self._error(operation, "source_not_found", "storage.error.invalid_in_place_receipt")
         source_ref = receipt.get("source_ref")
         source_root, source_kind = self._source_root_for_ref(source_ref, operation=operation)
         if source_kind != MANUAL_SOURCE_REF_KIND:
-            raise _provider_error(operation, "source_not_found", "原地导入回执无效")
+            raise self._error(operation, "source_not_found", "storage.error.invalid_in_place_receipt")
         path, relative = self._path_from_ref(
             source_ref,
             root=source_root,
@@ -1100,10 +1132,10 @@ class LocalStorageProvider:
             expected_kind=source_kind,
         )
         if receipt.get("source_relative_path") != relative:
-            raise _provider_error(operation, "source_not_found", "原地导入回执无效")
+            raise self._error(operation, "source_not_found", "storage.error.invalid_in_place_receipt")
         identity = self._identity_from_ref(receipt, operation=operation)
         if not self._same_source_identity(path, identity):
-            raise _provider_error(operation, "source_not_found", "源文件已变化，未完成原地导入")
+            raise self._error(operation, "source_not_found", "storage.error.source_changed_in_place")
         return path
 
     @staticmethod
@@ -1138,9 +1170,9 @@ class LocalStorageProvider:
                         raise ValueError("staging path is not a file")
                     path.unlink()
             except OSError as exc:
-                raise _provider_error(operation, "unavailable", "导入暂存清理失败", retryable=True) from exc
+                raise self._error(operation, "unavailable", "storage.error.staging_cleanup_failed", retryable=True) from exc
             except ValueError as exc:
-                raise _provider_error(operation, "source_not_found", "导入操作记录无效") from exc
+                raise self._error(operation, "source_not_found", "storage.error.invalid_operation_journal") from exc
 
     def stage_import_file(
         self,
@@ -1155,11 +1187,11 @@ class LocalStorageProvider:
             "delete_after_commit",
             "in_place",
         }:
-            raise _provider_error("stage_import_file", "invalid_config", "源文件处置方式无效")
+            raise self._error("stage_import_file", "invalid_config", "storage.error.invalid_disposition")
         try:
             operation_name = self._operation_directory(operation_key)
         except (TypeError, ValueError) as exc:
-            raise _provider_error("stage_import_file", "invalid_config", "导入操作标识无效") from exc
+            raise self._error("stage_import_file", "invalid_config", "storage.error.invalid_operation_key") from exc
         source_path, source_relative, source_identity = self._source_for(source)
         metadata = MediaMetadataProbeService.probe_file(source_path)
         duration_seconds = max(0, int(metadata.duration_seconds or 0))
@@ -1178,7 +1210,7 @@ class LocalStorageProvider:
         try:
             target, target_relative = self._target_for(placement, operation_name)
         except (TypeError, ValueError) as exc:
-            raise _provider_error("stage_import_file", "invalid_config", "导入目标路径无效") from exc
+            raise self._error("stage_import_file", "invalid_config", "storage.error.invalid_target_path") from exc
         try:
             existing = None
             journal_path = self._journal_path(operation_name)
@@ -1193,13 +1225,13 @@ class LocalStorageProvider:
                     target_relative=target_relative,
                     source_disposition=source_disposition,
                 ):
-                    raise _provider_error("stage_import_file", "invalid_config", "导入操作标识已被占用")
+                    raise self._error("stage_import_file", "invalid_config", "storage.error.operation_key_conflict")
                 if existing["state"] == _OPERATION_STATE_PREPARING:
                     self._cleanup_preparing(existing, operation="stage_import_file")
                     journal_path.unlink(missing_ok=True)
                     existing = None
                 if existing is not None and existing["state"] == _OPERATION_STATE_ABORTED:
-                    raise _provider_error("stage_import_file", "invalid_config", "导入操作已终止")
+                    raise self._error("stage_import_file", "invalid_config", "storage.error.operation_aborted")
                 if existing is not None:
                     self._target_is_complete(target, existing, operation="stage_import_file")
                     return _staged_media(
@@ -1211,7 +1243,7 @@ class LocalStorageProvider:
                         resolution=resolution,
                     )
             if target.exists() or target.is_symlink():
-                raise _provider_error("stage_import_file", "invalid_config", "导入目标已存在")
+                raise self._error("stage_import_file", "invalid_config", "storage.error.target_exists")
             target_created = False
             preserve_preparing = False
             temporary: Path | None = None
@@ -1276,15 +1308,15 @@ class LocalStorageProvider:
                         target.unlink()
                     except OSError:
                         pass
-                raise _provider_error(
-                    "stage_import_file", "unavailable", "本地媒体写入失败", retryable=True
+                raise self._error(
+                    "stage_import_file", "unavailable", "storage.error.media_write_failed", retryable=True
                 ) from exc
             finally:
                 if temporary is not None:
                     temporary.unlink(missing_ok=True)
         except (OSError, ValueError) as exc:
-            raise _provider_error(
-                "stage_import_file", "unavailable", "本地媒体写入失败", retryable=True
+            raise self._error(
+                "stage_import_file", "unavailable", "storage.error.media_write_failed", retryable=True
             ) from exc
         receipt: JsonObject = {"operation_key": operation_name, "token": token}
         return _staged_media(
@@ -1327,10 +1359,10 @@ class LocalStorageProvider:
                         raise ValueError("source changed")
                     source.unlink()
             except ValueError as exc:
-                raise _provider_error("finalize_import", "source_not_found", "导入源已变化，未删除") from exc
+                raise self._error("finalize_import", "source_not_found", "storage.error.import_source_changed") from exc
             except OSError as exc:
-                raise _provider_error(
-                    "finalize_import", "unavailable", "导入源删除失败", retryable=True
+                raise self._error(
+                    "finalize_import", "unavailable", "storage.error.import_source_delete_failed", retryable=True
                 ) from exc
         journal["state"] = _OPERATION_STATE_FINALIZED
         self._write_journal(journal, operation="finalize_import")
@@ -1347,8 +1379,8 @@ class LocalStorageProvider:
                 self._target_is_complete(target, journal, operation="abort_import")
                 target.unlink()
         except OSError as exc:
-            raise _provider_error(
-                "abort_import", "unavailable", "导入暂存删除失败", retryable=True
+            raise self._error(
+                "abort_import", "unavailable", "storage.error.staging_delete_failed", retryable=True
             ) from exc
         journal["state"] = _OPERATION_STATE_ABORTED
         self._write_journal(journal, operation="abort_import")
@@ -1371,10 +1403,10 @@ class LocalStorageProvider:
                     raise ValueError("media is not file")
                 path.unlink()
         except ValueError as exc:
-            raise _provider_error("delete_media", "source_not_found", "媒体文件不可删除") from exc
+            raise self._error("delete_media", "source_not_found", "storage.error.media_undeletable") from exc
         except OSError as exc:
-            raise _provider_error(
-                "delete_media", "unavailable", "媒体文件删除失败", retryable=True
+            raise self._error(
+                "delete_media", "unavailable", "storage.error.media_delete_failed", retryable=True
             ) from exc
 
     def _media_path(self, media: MediaHandle, *, operation: str) -> Path:
@@ -1388,7 +1420,7 @@ class LocalStorageProvider:
             )
             identity = self._identity_from_ref(media.storage_ref, operation=operation)
             if not self._same_source_identity(path, identity):
-                raise _provider_error(operation, "source_not_found", "媒体文件已变化")
+                raise self._error(operation, "source_not_found", "storage.error.media_changed")
             return path
         path, _ = self._path_from_ref(
             media.storage_ref,
@@ -1412,10 +1444,10 @@ class LocalStorageProvider:
         try:
             fd = os.open(path, flags)
         except FileNotFoundError as exc:
-            raise _provider_error("open_transfer_source", "source_not_found", "媒体文件不存在") from exc
+            raise self._error("open_transfer_source", "source_not_found", "storage.error.media_not_found") from exc
         except OSError as exc:
-            raise _provider_error(
-                "open_transfer_source", "unavailable", "媒体文件读取失败", retryable=True
+            raise self._error(
+                "open_transfer_source", "unavailable", "storage.error.media_read_failed", retryable=True
             ) from exc
         try:
             descriptor = os.fstat(fd)
@@ -1428,17 +1460,18 @@ class LocalStorageProvider:
                 owner=self, media=media, path=path,
                 fd=fd,
                 snapshot=snapshot,
+                translations=self.translations,
             )
         except ValueError as exc:
             os.close(fd)
-            raise _provider_error("open_transfer_source", "source_not_found", "媒体文件不可读取") from exc
+            raise self._error("open_transfer_source", "source_not_found", "storage.error.media_unreadable") from exc
         except OSError as exc:
             try:
                 os.close(fd)
             except OSError:
                 pass
-            raise _provider_error(
-                "open_transfer_source", "unavailable", "媒体文件读取失败", retryable=True
+            raise self._error(
+                "open_transfer_source", "unavailable", "storage.error.media_read_failed", retryable=True
             ) from exc
 
         try:
@@ -1455,7 +1488,7 @@ class LocalStorageProvider:
             or source._owner is not self
             or source._media != media
         ):
-            raise _provider_error(operation, "invalid_config", "源会话与媒体不匹配")
+            raise self._error(operation, "invalid_config", "storage.error.transfer_source_mismatch")
         if self._is_in_place_ref(media.storage_ref):
             # 原地导入的媒体迁移成功后保留本地源文件，不自动清理。
             return
@@ -1467,12 +1500,12 @@ class LocalStorageProvider:
             source.assert_unchanged()
             path.unlink()
         except (ValueError, OSError):
-            raise _provider_error(
-                operation, "unavailable", "源文件清理未完成"
+            raise self._error(
+                operation, "unavailable", "storage.error.source_cleanup_incomplete"
             ) from None
         except ProviderOperationError:
-            raise _provider_error(
-                operation, "unavailable", "源文件身份无法确认，未完成清理"
+            raise self._error(
+                operation, "unavailable", "storage.error.source_identity_unconfirmed"
             ) from None
 
     @staticmethod
@@ -1511,15 +1544,15 @@ class LocalStorageProvider:
         try:
             return path.open("rb")
         except OSError as exc:
-            raise _provider_error(
-                "open_cover_source", "unavailable", "媒体读取失败", retryable=True
+            raise self._error(
+                "open_cover_source", "unavailable", "storage.error.media_read_error", retryable=True
             ) from exc
 
     def compute_file_hash(self, *, media: MediaHandle) -> str:
         operation = "compute_file_hash"
         size = media.file_size_bytes
         if isinstance(size, bool) or not isinstance(size, int) or size < 0:
-            raise _provider_error(operation, "invalid_config", "媒体文件大小无效")
+            raise self._error(operation, "invalid_config", "storage.error.invalid_media_size")
         path = self._media_path(media, operation=operation)
 
         try:
@@ -1594,16 +1627,15 @@ class LocalStorageProvider:
                 ):
                     raise ValueError("media changed during hashing")
         except FileNotFoundError as exc:
-            raise _provider_error(operation, "source_not_found", "媒体文件不存在") from exc
+            raise self._error(operation, "source_not_found", "storage.error.media_not_found") from exc
         except (OSError, ValueError) as exc:
-            raise _provider_error(
-                operation, "unavailable", "媒体文件读取失败", retryable=True
+            raise self._error(
+                operation, "unavailable", "storage.error.media_read_failed", retryable=True
             ) from exc
 
         return f"media-file-hash-v1:{hashlib.sha1(payload).hexdigest()}"
 
-    @staticmethod
-    def _workspace_path(workspace: Path, *, operation: str) -> Path:
+    def _workspace_path(self, workspace: Path, *, operation: str) -> Path:
         try:
             raw = Path(workspace).expanduser()
             if not raw.is_absolute():
@@ -1614,7 +1646,7 @@ class LocalStorageProvider:
             _reject_symlink_components(resolved)
             return resolved
         except (OSError, ValueError) as exc:
-            raise _provider_error(operation, "unavailable", "工作目录不可用", retryable=True) from exc
+            raise self._error(operation, "unavailable", "storage.error.workspace_unavailable", retryable=True) from exc
 
     @staticmethod
     def _parse_range(range_header: str, size: int) -> tuple[int, int] | None:
@@ -1638,14 +1670,14 @@ class LocalStorageProvider:
 
     async def handle_playback(self, *, media: MediaHandle, context: PlaybackContext) -> Response:
         if context.resource_path not in {"", None}:
-            raise _provider_error("playback", "unsupported", "本地存储不支持媒体子资源")
+            raise self._error("playback", "unsupported", "storage.error.unsupported_subresource")
         path = self._media_path(media, operation="playback")
         media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
         range_header = context.request.headers.get("range")
         try:
             size = path.stat().st_size
         except OSError as exc:
-            raise _provider_error("playback", "unavailable", "媒体读取失败", retryable=True) from exc
+            raise self._error("playback", "unavailable", "storage.error.media_read_error", retryable=True) from exc
         status_code = 200
         start, end = 0, size - 1
         length = size
@@ -1695,10 +1727,10 @@ class LocalStorageProvider:
             ]
             return build_layout(entries)
         except Mp4MergeError as exc:
-            raise _provider_error("merged_playback", "unsupported", exc.message) from exc
+            raise self._error("merged_playback", "unsupported", exc.message) from exc
         except OSError as exc:
-            raise _provider_error(
-                "merged_playback", "unavailable", "媒体文件读取失败", retryable=True
+            raise self._error(
+                "merged_playback", "unavailable", "storage.error.media_read_failed", retryable=True
             ) from exc
 
     def preflight_merged_playback(self, *, medias: tuple[MediaHandle, ...]) -> None:
@@ -1711,7 +1743,7 @@ class LocalStorageProvider:
         context: PlaybackContext,
     ) -> Response:
         if context.resource_path != "stream.mp4":
-            raise _provider_error("merged_playback", "source_not_found", "本地合并播放资源不存在")
+            raise self._error("merged_playback", "source_not_found", "storage.error.merged_resource_not_found")
         layout = await asyncio.to_thread(self._build_merged_layout, medias=medias)
         return merged_range_requests_response(context.request, layout, "video/mp4")
 
@@ -1720,15 +1752,15 @@ class LocalStorageProvider:
         progress_callback: Callable[[str], None] | None = None,
     ) -> ThumbnailGeneration:
         if progress_callback:
-            progress_callback("正在打开本地视频")
+            progress_callback(self.translations.t("storage.progress.opening_video"))
         source = self._media_path(media, operation="generate_thumbnails")
         workspace = self._workspace_path(workspace, operation="generate_thumbnails")
         try:
             import av
             from PIL import Image
         except ImportError as exc:
-            raise _provider_error(
-                "generate_thumbnails", "unavailable", "缩略图组件不可用", retryable=True
+            raise self._error(
+                "generate_thumbnails", "unavailable", "storage.error.thumbnail_component_unavailable", retryable=True
             ) from exc
 
         interval_seconds = 10
@@ -1756,8 +1788,8 @@ class LocalStorageProvider:
             except ProviderOperationError:
                 raise
             except Exception as exc:
-                raise _provider_error(
-                    "generate_thumbnails", "unavailable", "缩略图生成失败", retryable=True
+                raise self._error(
+                    "generate_thumbnails", "unavailable", "storage.error.thumbnail_failed", retryable=True
                 ) from exc
             finally:
                 if image is not None:
@@ -1770,8 +1802,8 @@ class LocalStorageProvider:
             with av.open(str(source)) as container:
                 video_streams = getattr(container.streams, "video", ())
                 if not video_streams:
-                    raise _provider_error(
-                        "generate_thumbnails", "unavailable", "视频流不存在", retryable=True
+                    raise self._error(
+                        "generate_thumbnails", "unavailable", "storage.error.video_stream_missing", retryable=True
                     )
                 stream = video_streams[0]
                 if duration_seconds <= 0:
@@ -1791,7 +1823,13 @@ class LocalStorageProvider:
 
                 expected_count = duration_seconds // interval_seconds + 1
                 if progress_callback:
-                    progress_callback(f"正在生成缩略图 · 已生成 0/{expected_count} 张")
+                    progress_callback(
+                        self.translations.t(
+                            "storage.progress.thumbnails",
+                            done=0,
+                            total=expected_count,
+                        )
+                    )
                 for offset in range(0, duration_seconds + 1, interval_seconds):
                     try:
                         if offset == 0:
@@ -1824,16 +1862,20 @@ class LocalStorageProvider:
                         )
                     if progress_callback:
                         progress_callback(
-                            f"正在生成缩略图 · 已生成 {len(artifacts)}/{expected_count} 张"
+                            self.translations.t(
+                                "storage.progress.thumbnails",
+                                done=len(artifacts),
+                                total=expected_count,
+                            )
                         )
         except ProviderOperationError:
             raise
         except Exception as exc:
-            raise _provider_error(
-                "generate_thumbnails", "unavailable", "视频解码失败", retryable=True
+            raise self._error(
+                "generate_thumbnails", "unavailable", "storage.error.video_decode_failed", retryable=True
             ) from exc
         if not artifacts:
-            raise _provider_error("generate_thumbnails", "source_not_found", "视频没有可用画面")
+            raise self._error("generate_thumbnails", "source_not_found", "storage.error.no_video_frames")
         expected_count = max(1, duration_seconds // interval_seconds + 1)
         return ThumbnailGeneration(expected_count=expected_count, artifacts=tuple(artifacts))
 
@@ -1851,7 +1893,7 @@ class LocalStorageProvider:
             or start_offset_seconds < 0
             or end_offset_seconds <= start_offset_seconds
         ):
-            raise _provider_error("create_clip", "invalid_config", "片段时间范围无效")
+            raise self._error("create_clip", "invalid_config", "storage.error.invalid_clip_range")
         source = self._media_path(media, operation="create_clip")
         workspace = self._workspace_path(workspace, operation="create_clip")
         destination = workspace / "clip.mp4"
@@ -1891,16 +1933,16 @@ class LocalStorageProvider:
             os.replace(temporary, destination)
             temporary = None
         except FileNotFoundError as exc:
-            raise _provider_error(
-                "create_clip", "unavailable", "视频剪辑组件不可用", retryable=True
+            raise self._error(
+                "create_clip", "unavailable", "storage.error.clip_component_unavailable", retryable=True
             ) from exc
         except subprocess.TimeoutExpired as exc:
-            raise _provider_error(
-                "create_clip", "unavailable", "视频剪辑超时", retryable=True
+            raise self._error(
+                "create_clip", "unavailable", "storage.error.clip_timeout", retryable=True
             ) from exc
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
-            raise _provider_error(
-                "create_clip", "unavailable", "视频剪辑失败", retryable=True
+            raise self._error(
+                "create_clip", "unavailable", "storage.error.clip_failed", retryable=True
             ) from exc
         finally:
             if temporary is not None:
