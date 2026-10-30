@@ -18,7 +18,7 @@ def test_manifest_and_registration_declare_compatible_host_api(tmp_path: Path) -
     )
     assert manifest["plugin_id"] == PLUGIN_ID
     assert manifest["display_name"] == DISPLAY_NAME
-    assert manifest["host_api_version"] == 12
+    assert manifest["host_api_version"] == 14
     assert manifest["dependencies"] == [
         "qbittorrent-api>=2026.8.1",
         "libtorrent==2.0.9; sys_platform == 'darwin' and platform_machine == 'x86_64'",

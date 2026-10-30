@@ -36,7 +36,7 @@
 
 ## 多语言
 
-本插件声明 Host API 12，支持 `zh-CN` / `en`：
+本插件声明 Host API 14，支持 `zh-CN` / `en`：
 
 - 语言包放在 `i18n/zh-CN.json`、`i18n/en.json`；`translations.py` 只负责在
   插件导入时读取它们并生成静态 `*_i18n` 字典，也提供运行时翻译器

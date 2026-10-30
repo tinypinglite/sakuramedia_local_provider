@@ -63,6 +63,7 @@ _HASH_HEAD_TAIL_BYTES = 3 * _HASH_MIB
 _HASH_MIDDLE_BYTES = _HASH_MIB
 _HASH_FULL_THRESHOLD = 8 * _HASH_MIB
 _HASH_DOMAIN = b"media-file-hash-v1"
+_TRANSFER_CONTENT_HASH_CHUNK_BYTES = 1024 * 1024
 _OPERATION_KIND = "local_import"
 _OPERATION_STATE_PREPARING = "preparing"
 _OPERATION_STATE_STAGED = "staged"
@@ -294,6 +295,29 @@ class _LocalTransferSource(_TranslatedErrors):
     def _ensure_open(self) -> None:
         if self._closed:
             raise ValueError("I/O operation on closed transfer source")
+
+
+def _is_lower_hex(value: object, length: int) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == length
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _read_transfer_content_hashes(source: _LocalTransferSource) -> tuple[str, str]:
+    md5 = hashlib.md5(usedforsecurity=False)
+    sha1 = hashlib.sha1()
+    remaining = source.info.size_bytes
+    with source.open_reader() as reader:
+        while remaining:
+            chunk = reader.read(min(_TRANSFER_CONTENT_HASH_CHUNK_BYTES, remaining))
+            if not chunk:
+                raise ValueError("transfer source ended during hashing")
+            md5.update(chunk)
+            sha1.update(chunk)
+            remaining -= len(chunk)
+    return md5.hexdigest(), sha1.hexdigest()
 
 
 def _is_video(name: str) -> bool:
@@ -1472,11 +1496,23 @@ class LocalStorageProvider(_TranslatedErrors):
             snapshot = _TransferFileSnapshot.from_stat(descriptor)
             if snapshot.size != media.file_size_bytes:
                 raise ValueError("media size changed")
+            cached_md5 = getattr(media, "content_md5", None)
+            cached_sha1 = getattr(media, "content_sha1", None)
+            has_cached_hashes = (
+                _is_lower_hex(cached_md5, 32)
+                and _is_lower_hex(cached_sha1, 40)
+            )
             source = _LocalTransferSource(
                 owner=self, media=media, path=path,
                 fd=fd,
                 snapshot=snapshot,
                 translations=self.translations,
+            )
+            source.info = MediaTransferSourceInfo(
+                file_name=path.name,
+                size_bytes=snapshot.size,
+                content_md5=cached_md5 if has_cached_hashes else None,
+                content_sha1=cached_sha1 if has_cached_hashes else None,
             )
         except ValueError as exc:
             os.close(fd)
@@ -1491,6 +1527,25 @@ class LocalStorageProvider(_TranslatedErrors):
             ) from exc
 
         try:
+            if not has_cached_hashes:
+                try:
+                    content_md5, content_sha1 = _read_transfer_content_hashes(source)
+                except ProviderOperationError:
+                    raise
+                except (OSError, ValueError) as exc:
+                    raise self._error(
+                        "open_transfer_source",
+                        "unavailable",
+                        "storage.error.media_read_failed",
+                        retryable=True,
+                    ) from exc
+                source.info = MediaTransferSourceInfo(
+                    file_name=path.name,
+                    size_bytes=snapshot.size,
+                    content_md5=content_md5,
+                    content_sha1=content_sha1,
+                )
+            source.assert_unchanged()
             yield source
         finally:
             source._close()

@@ -10,8 +10,8 @@
     "zh-CN": "接入本地媒体目录，提供手动导入、qBittorrent 下载、后端代理播放、缩略图和片段。",
     "en": "Connects to local media folders and offers manual import, qBittorrent downloads, backend-proxied playback, thumbnails and clips."
   },
-  "version": "0.2.11",
-  "host_api_version": 12,
+  "version": "0.2.12",
+  "host_api_version": 14,
   "requires_python": ">=3.10,<3.11",
   "dependencies": [
     "qbittorrent-api>=2026.8.1",

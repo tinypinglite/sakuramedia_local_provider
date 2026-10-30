@@ -49,6 +49,8 @@ def _media(
     media_id: int = 1,
     duration: int = 20,
     file_size_bytes: int = 0,
+    content_md5: str | None = None,
+    content_sha1: str | None = None,
 ) -> MediaHandle:
     return MediaHandle(
         media_id=media_id,
@@ -57,6 +59,8 @@ def _media(
         file_name=Path(relative_path).name,
         file_size_bytes=file_size_bytes,
         duration_seconds=duration,
+        content_md5=content_md5,
+        content_sha1=content_sha1,
     )
 
 
@@ -388,6 +392,63 @@ def test_open_transfer_source_exposes_independent_pathless_seekable_readers(tmp_
             assert first.read() == b"789"
             assert second.read() == b"23456789"
         source.assert_unchanged()
+
+
+def test_open_transfer_source_computes_and_reuses_full_content_hashes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    provider, library, media_root, _import_root = _provider(tmp_path)
+    path = media_root / "movie.mp4"
+    path.write_bytes(b"abc")
+
+    with provider.open_transfer_source(
+        media=_media(library, "movie.mp4", file_size_bytes=3)
+    ) as source:
+        assert source.info.content_md5 == "900150983cd24fb0d6963f7d28e17f72"
+        assert source.info.content_sha1 == "a9993e364706816aba3e25717850c26c9cd0d89d"
+        cached_media = _media(
+            library,
+            "movie.mp4",
+            file_size_bytes=3,
+            content_md5=source.info.content_md5,
+            content_sha1=source.info.content_sha1,
+        )
+
+    def fail_read(*_args, **_kwargs):
+        raise AssertionError("cached transfer hashes must not read the file")
+
+    monkeypatch.setattr(storage_module._LocalTransferReader, "read", fail_read)
+    with provider.open_transfer_source(media=cached_media) as source:
+        assert source.info.content_md5 == cached_media.content_md5
+        assert source.info.content_sha1 == cached_media.content_sha1
+
+
+def test_open_transfer_source_rejects_change_during_hashing(
+    tmp_path: Path, monkeypatch
+) -> None:
+    provider, library, media_root, _import_root = _provider(tmp_path)
+    path = media_root / "movie.mp4"
+    path.write_bytes(b"content")
+    read_hashes = storage_module._read_transfer_content_hashes
+
+    def mutate_then_hash(source):
+        path.write_bytes(b"changed")
+        return read_hashes(source)
+
+    monkeypatch.setattr(
+        storage_module, "_read_transfer_content_hashes", mutate_then_hash
+    )
+
+    with (
+        pytest.raises(ProviderOperationError) as error,
+        provider.open_transfer_source(
+            media=_media(library, "movie.mp4", file_size_bytes=7)
+        ),
+    ):
+        pass
+
+    assert error.value.operation == "open_transfer_source"
+    assert error.value.code == "source_not_found"
 
 
 def test_open_transfer_source_keeps_original_inode_but_rejects_path_replacement(
