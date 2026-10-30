@@ -1014,12 +1014,13 @@ def test_thumbnails_seek_each_offset_and_write_webp(
             return Image.new("RGB", (16, 16), "red")
 
     class FakeContainer:
-        stream = SimpleNamespace(type="video", time_base=1)
+        stream = SimpleNamespace(type="video", time_base=1 / 90_000, start_time=90)
         streams = SimpleNamespace(video=(stream,))
 
         def __init__(self):
             self.seek_calls = []
             self.decode_calls = 0
+            self.frame_times = iter((0.001, 8.342666666666666, 16.684333333333335))
 
         def __enter__(self):
             return self
@@ -1036,7 +1037,7 @@ def test_thumbnails_seek_each_offset_and_write_webp(
         def decode(self, stream):
             assert stream is self.stream
             self.decode_calls += 1
-            return iter((FakeFrame(0),))
+            return iter((FakeFrame(next(self.frame_times)),))
 
     container = FakeContainer()
     fake_av = SimpleNamespace(open=lambda _path: container)
@@ -1053,10 +1054,66 @@ def test_thumbnails_seek_each_offset_and_write_webp(
         f"正在生成缩略图 · 已生成 {count}/3 张" for count in range(4)
     ]
     assert generation.expected_count == 3
-    assert [artifact.offset_seconds for artifact in generation.artifacts] == [0, 10, 20]
-    assert container.seek_calls == [10, 20]
+    assert [artifact.offset_seconds for artifact in generation.artifacts] == [0, 8, 16]
+    assert container.seek_calls == [900_000, 1_800_000]
     assert container.decode_calls == 3
     assert all((workspace / artifact.relative_path).read_bytes().startswith(b"RIFF") for artifact in generation.artifacts)
+
+
+def test_thumbnails_deduplicate_actual_frame_offsets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider, library, media_root, _import_root = _provider(tmp_path)
+    path = media_root / "videos/clip.mp4"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"placeholder")
+
+    from PIL import Image
+
+    class FakeFrame:
+        def __init__(self, time: float):
+            self.time = time
+            self.pts = None
+
+        def to_image(self):
+            return Image.new("RGB", (16, 16), "red")
+
+    class FakeContainer:
+        stream = SimpleNamespace(type="video", time_base=1, start_time=0)
+        streams = SimpleNamespace(video=(stream,))
+
+        def __init__(self):
+            self.frame_times = iter((0, 8.34, 8.34))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def seek(self, *_args, **_kwargs):
+            return None
+
+        def decode(self, stream):
+            assert stream is self.stream
+            return iter((FakeFrame(next(self.frame_times)),))
+
+    fake_av = SimpleNamespace(open=lambda _path: FakeContainer())
+    monkeypatch.setitem(sys.modules, "av", fake_av)
+    monkeypatch.setattr(storage_module.os, "nice", lambda _value: 0)
+    workspace = tmp_path / "thumbs"
+
+    generation = provider.generate_thumbnails(
+        media=_media(library, "videos/clip.mp4", duration=20),
+        workspace=workspace,
+    )
+
+    assert generation.expected_count == 2
+    assert [artifact.offset_seconds for artifact in generation.artifacts] == [0, 8]
+    assert sorted(path.name for path in workspace.iterdir()) == [
+        "thumbnail-0.webp",
+        "thumbnail-8.webp",
+    ]
 
 
 def test_create_clip_uses_single_media_ffmpeg_command(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

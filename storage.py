@@ -347,6 +347,22 @@ def _ensure_under(path: Path, root: Path) -> None:
         raise ValueError("path escapes root") from exc
 
 
+def _frame_offset_seconds(frame: Any, video: Any, fallback: int) -> int:
+    """Convert an absolute frame timestamp to a playback-relative second."""
+    frame_time = getattr(frame, "time", None)
+    time_base = getattr(video, "time_base", None)
+    if frame_time is None:
+        pts = getattr(frame, "pts", None)
+        if pts is not None and time_base is not None:
+            frame_time = float(pts * time_base)
+    if frame_time is None:
+        return max(0, int(fallback))
+    start_time = getattr(video, "start_time", None)
+    if start_time is not None and time_base is not None:
+        frame_time -= float(start_time * time_base)
+    return max(0, int(frame_time))
+
+
 class LocalStorageProvider(_TranslatedErrors):
     """A provider-neutral local filesystem storage implementation."""
 
@@ -1766,9 +1782,11 @@ class LocalStorageProvider(_TranslatedErrors):
         interval_seconds = 10
         duration_seconds = max(0, int(media.duration_seconds or 0))
         artifacts: list[ThumbnailArtifact] = []
+        failed_count = 0
+        seen_offsets: set[int] = set()
 
-        def write_thumbnail(frame: Any, offset: int) -> None:
-            relative = f"thumbnail-{offset}.webp"
+        def write_thumbnail(frame: Any, actual_offset: int) -> None:
+            relative = f"thumbnail-{actual_offset}.webp"
             destination = workspace / relative
             _reject_symlink_components(destination)
             temporary: Path | None = None
@@ -1784,7 +1802,9 @@ class LocalStorageProvider(_TranslatedErrors):
                     raise ValueError("empty thumbnail")
                 os.replace(temporary, destination)
                 temporary = None
-                artifacts.append(ThumbnailArtifact(offset_seconds=offset, relative_path=relative))
+                artifacts.append(
+                    ThumbnailArtifact(offset_seconds=actual_offset, relative_path=relative)
+                )
             except ProviderOperationError:
                 raise
             except Exception as exc:
@@ -1821,13 +1841,13 @@ class LocalStorageProvider(_TranslatedErrors):
                 if duration_seconds <= 0:
                     return ThumbnailGeneration(expected_count=0, artifacts=())
 
-                expected_count = duration_seconds // interval_seconds + 1
+                planned_count = duration_seconds // interval_seconds + 1
                 if progress_callback:
                     progress_callback(
                         self.translations.t(
                             "storage.progress.thumbnails",
                             done=0,
-                            total=expected_count,
+                            total=planned_count,
                         )
                     )
                 for offset in range(0, duration_seconds + 1, interval_seconds):
@@ -1846,14 +1866,19 @@ class LocalStorageProvider(_TranslatedErrors):
                                 any_frame=False,
                             )
                             frame = next(container.decode(stream))
-                        write_thumbnail(frame, offset)
+                        actual_offset = _frame_offset_seconds(frame, stream, offset)
+                        if actual_offset not in seen_offsets:
+                            write_thumbnail(frame, actual_offset)
+                            seen_offsets.add(actual_offset)
                     except StopIteration:
+                        failed_count += 1
                         logger.warning(
                             "Local thumbnail frame missing media_id=%s offset_seconds=%s",
                             media.media_id,
                             offset,
                         )
                     except Exception as exc:
+                        failed_count += 1
                         logger.warning(
                             "Local thumbnail frame failed media_id=%s offset_seconds=%s detail=%s",
                             media.media_id,
@@ -1865,7 +1890,7 @@ class LocalStorageProvider(_TranslatedErrors):
                             self.translations.t(
                                 "storage.progress.thumbnails",
                                 done=len(artifacts),
-                                total=expected_count,
+                                total=planned_count,
                             )
                         )
         except ProviderOperationError:
@@ -1876,7 +1901,7 @@ class LocalStorageProvider(_TranslatedErrors):
             ) from exc
         if not artifacts:
             raise self._error("generate_thumbnails", "source_not_found", "storage.error.no_video_frames")
-        expected_count = max(1, duration_seconds // interval_seconds + 1)
+        expected_count = max(1, len(artifacts) + failed_count)
         return ThumbnailGeneration(expected_count=expected_count, artifacts=tuple(artifacts))
 
     def create_clip(
