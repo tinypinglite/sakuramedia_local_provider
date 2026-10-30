@@ -5,7 +5,9 @@ import os
 import shutil
 import sys
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -51,6 +53,7 @@ def _media(
     file_size_bytes: int = 0,
     content_md5: str | None = None,
     content_sha1: str | None = None,
+    content_gcid: str | None = None,
 ) -> MediaHandle:
     return MediaHandle(
         media_id=media_id,
@@ -61,6 +64,7 @@ def _media(
         duration_seconds=duration,
         content_md5=content_md5,
         content_sha1=content_sha1,
+        content_gcid=content_gcid,
     )
 
 
@@ -406,12 +410,14 @@ def test_open_transfer_source_computes_and_reuses_full_content_hashes(
     ) as source:
         assert source.info.content_md5 == "900150983cd24fb0d6963f7d28e17f72"
         assert source.info.content_sha1 == "a9993e364706816aba3e25717850c26c9cd0d89d"
+        assert source.info.content_gcid == "0D3CED9BEC10A777AEC23CCC353A8C08A633045E"
         cached_media = _media(
             library,
             "movie.mp4",
             file_size_bytes=3,
             content_md5=source.info.content_md5,
             content_sha1=source.info.content_sha1,
+            content_gcid=source.info.content_gcid,
         )
 
     def fail_read(*_args, **_kwargs):
@@ -421,6 +427,85 @@ def test_open_transfer_source_computes_and_reuses_full_content_hashes(
     with provider.open_transfer_source(media=cached_media) as source:
         assert source.info.content_md5 == cached_media.content_md5
         assert source.info.content_sha1 == cached_media.content_sha1
+        assert source.info.content_gcid == cached_media.content_gcid
+
+
+def test_open_transfer_source_reuses_legacy_hashes_without_gcid(
+    tmp_path: Path, monkeypatch
+) -> None:
+    provider, library, media_root, _import_root = _provider(tmp_path)
+    path = media_root / "movie.mp4"
+    path.write_bytes(b"abc")
+    cached_media = _media(
+        library,
+        "movie.mp4",
+        file_size_bytes=3,
+        content_md5="900150983cd24fb0d6963f7d28e17f72",
+        content_sha1="a9993e364706816aba3e25717850c26c9cd0d89d",
+    )
+
+    def fail_read(*_args, **_kwargs):
+        raise AssertionError("legacy hash cache must not read the file")
+
+    monkeypatch.setattr(storage_module._LocalTransferReader, "read", fail_read)
+    with provider.open_transfer_source(media=cached_media) as source:
+        assert source.info.content_md5 == cached_media.content_md5
+        assert source.info.content_sha1 == cached_media.content_sha1
+        assert source.info.content_gcid is None
+
+
+@pytest.mark.parametrize(
+    ("size_bytes", "expected"),
+    (
+        (0, 0x40000),
+        (0x40000 * 0x200, 0x40000),
+        (0x40000 * 0x200 + 1, 0x80000),
+        (0x80000 * 0x200 + 1, 0x100000),
+        (0x100000 * 0x200 + 1, 0x200000),
+        (0x200000 * 0x200 + 1, 0x200000),
+    ),
+)
+def test_gcid_block_size_boundaries(size_bytes: int, expected: int) -> None:
+    assert storage_module._gcid_block_size(size_bytes) == expected
+
+
+def test_open_transfer_source_hashes_gcid_across_blocks(tmp_path: Path) -> None:
+    provider, library, media_root, _import_root = _provider(tmp_path)
+    size_bytes = 0x40000 + 1
+    (media_root / "movie.mp4").write_bytes(b"a" * size_bytes)
+
+    with provider.open_transfer_source(
+        media=_media(library, "movie.mp4", file_size_bytes=size_bytes)
+    ) as source:
+        assert source.info.content_gcid == "72900AD936E2EEAFB58050926858627ACB744D4B"
+
+
+def test_transfer_hash_reader_handles_short_reads(tmp_path: Path, monkeypatch) -> None:
+    provider, library, media_root, _import_root = _provider(tmp_path)
+    content = b"0123456789abcdefghijklmnopqrstuv"
+    (media_root / "movie.mp4").write_bytes(content)
+    original_read = storage_module._LocalTransferReader.read
+
+    def short_read(self, size=-1):
+        return original_read(self, min(size, 7) if size >= 0 else size)
+
+    monkeypatch.setattr(storage_module._LocalTransferReader, "read", short_read)
+    with provider.open_transfer_source(
+        media=_media(library, "movie.mp4", file_size_bytes=len(content))
+    ) as source:
+        assert source.info.content_gcid == "0699E9FAF578494165A01843CFF78363BAAC7F86"
+
+
+def test_transfer_hash_reader_rejects_early_eof() -> None:
+    class TruncatedSource:
+        info = SimpleNamespace(size_bytes=5)
+
+        @contextmanager
+        def open_reader(self):
+            yield BytesIO(b"abc")
+
+    with pytest.raises(ValueError, match="ended during hashing"):
+        storage_module._read_transfer_content_hashes(TruncatedSource())
 
 
 def test_open_transfer_source_rejects_change_during_hashing(

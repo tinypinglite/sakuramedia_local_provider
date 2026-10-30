@@ -63,7 +63,9 @@ _HASH_HEAD_TAIL_BYTES = 3 * _HASH_MIB
 _HASH_MIDDLE_BYTES = _HASH_MIB
 _HASH_FULL_THRESHOLD = 8 * _HASH_MIB
 _HASH_DOMAIN = b"media-file-hash-v1"
-_TRANSFER_CONTENT_HASH_CHUNK_BYTES = 1024 * 1024
+_GCID_MIN_BLOCK_BYTES = 0x40000
+_GCID_MAX_BLOCK_BYTES = 0x200000
+_GCID_MAX_BLOCKS = 0x200
 _OPERATION_KIND = "local_import"
 _OPERATION_STATE_PREPARING = "preparing"
 _OPERATION_STATE_STAGED = "staged"
@@ -305,19 +307,46 @@ def _is_lower_hex(value: object, length: int) -> bool:
     )
 
 
-def _read_transfer_content_hashes(source: _LocalTransferSource) -> tuple[str, str]:
+def _is_hex(value: object, length: int) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == length
+        and all(character in "0123456789abcdefABCDEF" for character in value)
+    )
+
+
+def _gcid_block_size(size_bytes: int) -> int:
+    block_size = _GCID_MIN_BLOCK_BYTES
+    while (
+        size_bytes > block_size * _GCID_MAX_BLOCKS
+        and block_size < _GCID_MAX_BLOCK_BYTES
+    ):
+        block_size <<= 1
+    return block_size
+
+
+def _read_transfer_content_hashes(
+    source: _LocalTransferSource,
+) -> tuple[str, str, str]:
     md5 = hashlib.md5(usedforsecurity=False)
     sha1 = hashlib.sha1()
+    gcid = hashlib.sha1()
     remaining = source.info.size_bytes
+    block_size = _gcid_block_size(remaining)
     with source.open_reader() as reader:
         while remaining:
-            chunk = reader.read(min(_TRANSFER_CONTENT_HASH_CHUNK_BYTES, remaining))
-            if not chunk:
-                raise ValueError("transfer source ended during hashing")
-            md5.update(chunk)
-            sha1.update(chunk)
-            remaining -= len(chunk)
-    return md5.hexdigest(), sha1.hexdigest()
+            wanted = min(block_size, remaining)
+            block = bytearray()
+            while len(block) < wanted:
+                chunk = reader.read(wanted - len(block))
+                if not chunk:
+                    raise ValueError("transfer source ended during hashing")
+                block.extend(chunk)
+            md5.update(block)
+            sha1.update(block)
+            gcid.update(hashlib.sha1(block).digest())
+            remaining -= len(block)
+    return md5.hexdigest(), sha1.hexdigest(), gcid.hexdigest().upper()
 
 
 def _is_video(name: str) -> bool:
@@ -1498,10 +1527,13 @@ class LocalStorageProvider(_TranslatedErrors):
                 raise ValueError("media size changed")
             cached_md5 = getattr(media, "content_md5", None)
             cached_sha1 = getattr(media, "content_sha1", None)
+            cached_gcid = getattr(media, "content_gcid", None)
             has_cached_hashes = (
                 _is_lower_hex(cached_md5, 32)
                 and _is_lower_hex(cached_sha1, 40)
             )
+            if not _is_hex(cached_gcid, 40):
+                cached_gcid = None
             source = _LocalTransferSource(
                 owner=self, media=media, path=path,
                 fd=fd,
@@ -1513,6 +1545,7 @@ class LocalStorageProvider(_TranslatedErrors):
                 size_bytes=snapshot.size,
                 content_md5=cached_md5 if has_cached_hashes else None,
                 content_sha1=cached_sha1 if has_cached_hashes else None,
+                content_gcid=cached_gcid if has_cached_hashes else None,
             )
         except ValueError as exc:
             os.close(fd)
@@ -1529,7 +1562,11 @@ class LocalStorageProvider(_TranslatedErrors):
         try:
             if not has_cached_hashes:
                 try:
-                    content_md5, content_sha1 = _read_transfer_content_hashes(source)
+                    (
+                        content_md5,
+                        content_sha1,
+                        content_gcid,
+                    ) = _read_transfer_content_hashes(source)
                 except ProviderOperationError:
                     raise
                 except (OSError, ValueError) as exc:
@@ -1544,6 +1581,7 @@ class LocalStorageProvider(_TranslatedErrors):
                     size_bytes=snapshot.size,
                     content_md5=content_md5,
                     content_sha1=content_sha1,
+                    content_gcid=content_gcid,
                 )
             source.assert_unchanged()
             yield source
