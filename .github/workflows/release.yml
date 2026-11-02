@@ -28,13 +28,21 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [ "$IS_PRERELEASE" = "true" ]; then
-            echo "::error::Pre-release does not trigger plugin publish"
+          stable_pattern='^v[0-9]+\.[0-9]+\.[0-9]+$'
+          beta_pattern='^v[0-9]+\.[0-9]+\.[0-9]+-beta\.[1-9][0-9]*$'
+
+          if [[ ! "$TAG" =~ $stable_pattern && ! "$TAG" =~ $beta_pattern ]]; then
+            echo "::error::Tag must match v<major>.<minor>.<patch> or v<major>.<minor>.<patch>-beta.<N>"
             exit 1
           fi
 
-          if ! [[ "$TAG" =~ ^v[0-9][0-9A-Za-z._-]*$ ]]; then
-            echo "::error::Tag must match v<version>"
+          if [ "$IS_PRERELEASE" = "true" ] && [[ ! "$TAG" =~ $beta_pattern ]]; then
+            echo "::error::Pre-release tags must use the -beta.<N> suffix"
+            exit 1
+          fi
+
+          if [ "$IS_PRERELEASE" != "true" ] && [[ "$TAG" =~ $beta_pattern ]]; then
+            echo "::error::Beta tags must be published as pre-releases"
             exit 1
           fi
 
