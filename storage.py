@@ -353,6 +353,24 @@ def _is_video(name: str) -> bool:
     return Path(name).suffix.lower() in _VIDEO_SUFFIXES
 
 
+def _log_skipped_entry(
+    operation: str,
+    path: Path,
+    relative_path: str | None,
+    exc: BaseException,
+) -> None:
+    logger.warning(
+        "local import %s entry skipped path=%s relative_path=%r "
+        "errno=%r error_type=%s error=%s",
+        operation,
+        path,
+        relative_path,
+        getattr(exc, "errno", None),
+        type(exc).__name__,
+        exc,
+    )
+
+
 def _relative_parts(value: object, *, allow_empty: bool = False) -> tuple[str, ...]:
     if not isinstance(value, str) or "\x00" in value or "\\" in value:
         raise ValueError("unsafe relative path")
@@ -666,28 +684,33 @@ class LocalStorageProvider(_TranslatedErrors):
             result["root_path"] = source_ref["root_path"]
         return result
 
-    def _entry(self, path: Path, *, relative_path: str) -> BrowseEntry:
+    def _entry(self, path: Path, *, relative_path: str) -> BrowseEntry | None:
         try:
-            stat = path.stat()
-        except OSError as exc:
-            logger.warning(
-                "local import browse entry stat failed path=%s "
-                "relative_path=%r errno=%r error=%s",
-                path,
-                relative_path,
-                getattr(exc, "errno", None),
-                exc,
-                exc_info=True,
+            entry_stat = path.stat(follow_symlinks=False)
+            if stat.S_ISDIR(entry_stat.st_mode):
+                entry_type = "directory"
+                size_bytes = None
+                is_video = False
+            elif stat.S_ISREG(entry_stat.st_mode):
+                entry_type = "file"
+                size_bytes = entry_stat.st_size
+                is_video = _is_video(path.name)
+            else:
+                return None
+            modified_at = datetime.fromtimestamp(
+                entry_stat.st_mtime,
+                tz=timezone.utc,
             )
-            raise self._error("browse", "unavailable", "storage.error.directory_read_failed", retryable=True) from exc
-        modified_at = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
+        except (OSError, OverflowError, ValueError) as exc:
+            _log_skipped_entry("browse", path, relative_path, exc)
+            return None
         return BrowseEntry(
             source_ref=self._manual_source_ref(relative_path),
             name=path.name,
-            entry_type="directory" if path.is_dir() else "file",
-            size_bytes=None if path.is_dir() else stat.st_size,
+            entry_type=entry_type,
+            size_bytes=size_bytes,
             modified_at=modified_at,
-            is_video=path.is_file() and _is_video(path.name),
+            is_video=is_video,
         )
 
     def browse(
@@ -715,11 +738,11 @@ class LocalStorageProvider(_TranslatedErrors):
         try:
             children = []
             for child in parent_path.iterdir():
-                # Symlink entries are never exposed or followed.
-                if child.is_symlink() or not (child.is_dir() or child.is_file()):
-                    continue
                 relative = "/".join(filter(None, (parent_relative, child.name)))
-                children.append((child.name.casefold(), child.name, self._entry(child, relative_path=relative)))
+                entry = self._entry(child, relative_path=relative)
+                if entry is None:
+                    continue
+                children.append((child.name.casefold(), child.name, entry))
         except OSError as exc:
             logger.warning(
                 "local import browse directory read failed path=%s errno=%r error=%s",
@@ -791,25 +814,28 @@ class LocalStorageProvider(_TranslatedErrors):
         for index, candidate in enumerate(candidates):
             report("storage.progress.stage.checking_files", index, total)
             try:
-                if candidate.is_symlink() or not candidate.is_file():
+                candidate_stat = candidate.stat(follow_symlinks=False)
+                if not stat.S_ISREG(candidate_stat.st_mode):
                     continue
                 _reject_symlink_components(candidate)
                 resolved = candidate.resolve(strict=True)
                 _ensure_under(resolved, source_root.resolve(strict=False))
                 relative = _posix_relative(candidate, source_root)
-                stat = candidate.stat()
             except (OSError, ValueError) as exc:
                 if isinstance(exc, ValueError):
                     continue
-                raise self._error(
-                    "scan_import_source", "unavailable", "storage.error.file_read_failed", retryable=True
-                ) from exc
+                try:
+                    relative = _posix_relative(candidate, source_root)
+                except ValueError:
+                    relative = None
+                _log_skipped_entry("scan_import_source", candidate, relative, exc)
+                continue
             result.append(
                 ImportFile(
                     source_ref=self._source_ref_with_relative(source_ref, relative),
                     name=candidate.name,
                     relative_path=relative,
-                    size_bytes=stat.st_size,
+                    size_bytes=candidate_stat.st_size,
                     is_video=_is_video(candidate.name),
                 )
             )
