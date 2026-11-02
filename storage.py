@@ -670,6 +670,15 @@ class LocalStorageProvider(_TranslatedErrors):
         try:
             stat = path.stat()
         except OSError as exc:
+            logger.warning(
+                "local import browse entry stat failed path=%s "
+                "relative_path=%r errno=%r error=%s",
+                path,
+                relative_path,
+                getattr(exc, "errno", None),
+                exc,
+                exc_info=True,
+            )
             raise self._error("browse", "unavailable", "storage.error.directory_read_failed", retryable=True) from exc
         modified_at = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
         return BrowseEntry(
@@ -712,6 +721,13 @@ class LocalStorageProvider(_TranslatedErrors):
                 relative = "/".join(filter(None, (parent_relative, child.name)))
                 children.append((child.name.casefold(), child.name, self._entry(child, relative_path=relative)))
         except OSError as exc:
+            logger.warning(
+                "local import browse directory read failed path=%s errno=%r error=%s",
+                parent_path,
+                getattr(exc, "errno", None),
+                exc,
+                exc_info=True,
+            )
             raise self._error("browse", "unavailable", "storage.error.directory_read_failed", retryable=True) from exc
         children.sort(key=lambda item: (item[0], item[1]))
         page = children[offset : offset + limit]

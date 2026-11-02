@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import errno
+import logging
 import os
 import shutil
 import sys
@@ -99,6 +101,78 @@ def test_browse_scan_refs_are_relative_and_symlinks_are_ignored(tmp_path: Path) 
         "kind": "manual_local_path",
         "relative_path": "nested/clip.mp4",
     }
+
+
+def test_browse_logs_entry_stat_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    provider, _library, _media_root, import_root = _provider(tmp_path)
+    target = import_root / "unreadable"
+    target.mkdir()
+    original_is_symlink = Path.is_symlink
+    original_is_dir = Path.is_dir
+    original_is_file = Path.is_file
+    original_stat = Path.stat
+
+    def is_symlink(path: Path) -> bool:
+        return False if path == target else original_is_symlink(path)
+
+    def is_dir(path: Path) -> bool:
+        return True if path == target else original_is_dir(path)
+
+    def is_file(path: Path) -> bool:
+        return False if path == target else original_is_file(path)
+
+    def fail_stat(path: Path, *args, **kwargs):
+        if path == target:
+            raise PermissionError(errno.EACCES, "permission denied", str(path))
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "is_symlink", is_symlink)
+    monkeypatch.setattr(Path, "is_dir", is_dir)
+    monkeypatch.setattr(Path, "is_file", is_file)
+    monkeypatch.setattr(Path, "stat", fail_stat)
+
+    with (
+        caplog.at_level(logging.WARNING, logger=storage_module.__name__),
+        pytest.raises(ProviderOperationError) as error,
+    ):
+        provider.browse(parent_ref=None, cursor=None, limit=20)
+
+    assert error.value.code == "unavailable"
+    assert f"path={target}" in caplog.text
+    assert "relative_path='unreadable'" in caplog.text
+    assert f"errno={errno.EACCES}" in caplog.text
+    assert "PermissionError" in caplog.text
+
+
+def test_browse_logs_directory_iteration_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    provider, _library, _media_root, import_root = _provider(tmp_path)
+    original_iterdir = Path.iterdir
+
+    def fail_iterdir(path: Path):
+        if path == import_root:
+            raise PermissionError(errno.EACCES, "permission denied", str(path))
+        return original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", fail_iterdir)
+
+    with (
+        caplog.at_level(logging.WARNING, logger=storage_module.__name__),
+        pytest.raises(ProviderOperationError) as error,
+    ):
+        provider.browse(parent_ref=None, cursor=None, limit=20)
+
+    assert error.value.code == "unavailable"
+    assert f"path={import_root}" in caplog.text
+    assert f"errno={errno.EACCES}" in caplog.text
+    assert "PermissionError" in caplog.text
 
 
 def test_space_usage_reports_disk_capacity(tmp_path: Path) -> None:
