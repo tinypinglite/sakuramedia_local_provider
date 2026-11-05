@@ -20,6 +20,8 @@
 
 ## 配置 qBittorrent 下载器
 
+该下载器只接受 magnet 和 `.torrent` 种子，不处理 eD2k 或 HTTP 直链。
+
 先创建上述本地媒体库，再在「系统设置 → 下载器」点击「新建下载器」，选择该媒体库作为「目标媒体库」。下载器不单独选择 Provider，选择媒体库后才会显示 qBittorrent 的配置字段：
 
 - qBittorrent 地址、用户名、密码：qBittorrent WebUI 的连接信息。
