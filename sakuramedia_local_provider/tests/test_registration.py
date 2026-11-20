@@ -1,0 +1,87 @@
+from __future__ import annotations
+
+import json
+from functools import partial
+from pathlib import Path
+
+from sakuramedia_local_provider.plugin import DISPLAY_NAME, PLUGIN_ID, register
+
+from src.plugins import HOST_API_VERSION, PluginContext
+from src.plugins.i18n import PluginI18n
+from src.plugins.provider_protocol import MEDIA_PROVIDER_EXTENSION_KEY
+
+
+def test_manifest_and_registration_declare_compatible_host_api(tmp_path: Path) -> None:
+    manifest = json.loads((Path(__file__).parents[1] / "manifest.json").read_text(encoding="utf-8"))
+    registration = register(
+        PluginContext(plugin_id=PLUGIN_ID, settings={}, data_dir=tmp_path / "plugin-data")
+    )
+    assert manifest["plugin_id"] == PLUGIN_ID
+    assert manifest["display_name"] == DISPLAY_NAME
+    assert manifest["host_api_version"] == 18
+    assert manifest["dependencies"] == [
+        "qbittorrent-api>=2026.8.1",
+        "libtorrent==2.0.9; sys_platform == 'darwin' and platform_machine == 'x86_64'",
+        "libtorrent>=2.1.1,<3.0.0; sys_platform != 'darwin' or platform_machine == 'arm64'",
+    ]
+    assert registration.plugin_id == PLUGIN_ID
+    assert registration.display_name == DISPLAY_NAME
+    # manifest 是导入前的兼容下限；官方插件按宿主当前常量注册（loader 两种都接受）。
+    assert registration.host_api_version == HOST_API_VERSION
+    assert [extension.key for extension in registration.extensions] == [MEDIA_PROVIDER_EXTENSION_KEY]
+    assert registration.extensions[0].data.playback_deliveries == ("proxy",)
+
+
+def test_bundle_declares_in_place_import_capability(tmp_path: Path) -> None:
+    registration = register(
+        PluginContext(plugin_id=PLUGIN_ID, settings={}, data_dir=tmp_path / "plugin-data")
+    )
+    assert registration.extensions[0].data.supports_in_place_import is True
+
+
+def test_library_configuration_is_normalised_without_creating_directories(tmp_path: Path) -> None:
+    registration = register(
+        PluginContext(plugin_id=PLUGIN_ID, settings={}, data_dir=tmp_path / "plugin-data")
+    )
+    bundle = registration.extensions[0].data
+    media_root = tmp_path / "media"
+    manual_import_root = tmp_path / "imports"
+    prepared = bundle.prepare_library(
+        submitted_config={
+            "media_root_path": str(media_root),
+            "manual_import_root_path": str(manual_import_root),
+        },
+        previous=None,
+    )
+    assert prepared.provider_config == {
+        "media_root_path": str(media_root),
+        "manual_import_root_path": str(manual_import_root),
+    }
+    assert not media_root.exists()
+    assert not manual_import_root.exists()
+
+
+def test_registration_preserves_plugin_data_directory(tmp_path: Path) -> None:
+    data_dir = tmp_path / "plugin-data"
+    registration = register(
+        PluginContext(plugin_id=PLUGIN_ID, settings={}, data_dir=data_dir)
+    )
+    bundle = registration.extensions[0].data
+    assert bundle.data_dir == data_dir
+
+
+def test_empty_directory_cleanup_is_manual_and_has_no_parameters(tmp_path: Path) -> None:
+    from sakuramedia_local_provider.cleanup import cleanup_empty_media_dirs
+
+    registration = register(
+        PluginContext(plugin_id=PLUGIN_ID, settings={}, data_dir=tmp_path / 'data')
+    )
+    assert len(registration.jobs) == 1
+    job = registration.jobs[0]
+    assert job.task_key == 'sakuramedia_local_cleanup_empty_media_dirs'
+    assert job.manual_only and job.manual_trigger_allowed
+    assert job.params_schema is None
+    # 处理器绑定插件上下文里的翻译器，语言跟随任务语言。
+    assert isinstance(job.handler, partial)
+    assert job.handler.func is cleanup_empty_media_dirs
+    assert isinstance(job.handler.keywords["i18n"], PluginI18n)

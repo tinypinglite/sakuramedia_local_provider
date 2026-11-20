@@ -1,0 +1,163 @@
+name: Release Plugin
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      plugin_id: ${{ steps.meta.outputs.plugin_id }}
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      display_name: ${{ steps.meta.outputs.display_name }}
+      host_api_version: ${{ steps.meta.outputs.host_api_version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Validate release target
+        id: meta
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          PRERELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          set -euo pipefail
+          git fetch --force origin main
+          git merge-base --is-ancestor "$(git rev-list -n1 "$TAG")" origin/main
+          python .github/scripts/release_target.py \
+            --tag "$TAG" \
+            --repo-root . \
+            --github-output "$GITHUB_OUTPUT" \
+            --prerelease "$PRERELEASE"
+
+  build:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile in backend base image
+        env:
+          PLUGIN_ID: ${{ needs.validate.outputs.plugin_id }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -e PLUGIN_ID -e ARCH \
+            -v "$PWD:/work" -w /work \
+            python:3.10-slim-bookworm@sha256:68d914ec641a0b69267ce65184d000a2bc3a9ee2590ab702b82250ab2385735a \
+            bash .github/scripts/build_in_container.sh "$PLUGIN_ID" "$ARCH" "/work/dist/$ARCH"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: so-${{ matrix.arch }}
+          path: dist/${{ matrix.arch }}/*.so
+          if-no-files-found: error
+
+  verify:
+    needs: [validate, build]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: so-${{ matrix.arch }}
+          path: dist/so
+      - name: Assemble and load-test compiled plugin
+        env:
+          PLUGIN_ID: ${{ needs.validate.outputs.plugin_id }}
+        run: |
+          set -euo pipefail
+          plugin_dir="poc/plugins/$PLUGIN_ID"
+          mkdir -p "$plugin_dir"
+          cp .github/scripts/plugin_shim.py "$plugin_dir/__init__.py"
+          cp "$PLUGIN_ID/manifest.json" "$plugin_dir/manifest.json"
+          cp dist/so/*.so "$plugin_dir/"
+          cp "$PLUGIN_ID/LICENSE" "$plugin_dir/" || true
+          for extra in i18n prompts top250.json; do
+            if [ -e "$PLUGIN_ID/$extra" ]; then
+              cp -R "$PLUGIN_ID/$extra" "$plugin_dir/$extra"
+            fi
+          done
+          docker run --rm \
+            -e PYTHONPATH=/app -w /app \
+            --entrypoint python \
+            -v "$PWD/poc:/poc" \
+            -v "$PWD/.github/scripts/verify_compiled_plugin.py:/verify.py" \
+            tinyping/sakuramediabe:latest /verify.py "$PLUGIN_ID"
+
+  package:
+    needs: [validate, build, verify]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: so-*
+          merge-multiple: true
+          path: dist/so
+      - name: Assemble plugin zip
+        env:
+          PLUGIN_ID: ${{ needs.validate.outputs.plugin_id }}
+        run: |
+          set -euo pipefail
+          python .github/scripts/package_plugin.py \
+            --plugin-dir "$PLUGIN_ID" \
+            --so-dir dist/so \
+            --shim .github/scripts/plugin_shim.py \
+            --output-dir dist \
+            --release-api-url "https://api.github.com/repos/tinypinglite/sakuramedia_local_provider/releases/latest"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plugin-package
+          path: dist/*.zip*
+          if-no-files-found: error
+
+  publish:
+    needs: [validate, package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      PLUGIN_ID: ${{ needs.validate.outputs.plugin_id }}
+      VERSION: ${{ needs.validate.outputs.version }}
+      TAG: ${{ needs.validate.outputs.tag }}
+      ZIP_NAME: ${{ needs.validate.outputs.plugin_id }}-${{ needs.validate.outputs.version }}.zip
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: plugin-package
+          path: dist
+      - name: Upload assets to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          test -f "dist/$ZIP_NAME"
+          gh release upload "$TAG" "dist/$ZIP_NAME" "dist/$ZIP_NAME.sha256" --clobber
+

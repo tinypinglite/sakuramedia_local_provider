@@ -1,0 +1,73 @@
+# SakuraMedia 本地存储与 qBittorrent
+
+把本地目录接入 SakuraMedia 的媒体库，并提供手动导入、qBittorrent 下载、播放、缩略图和片段。
+
+源码：<https://github.com/tinypinglite/sakuramedia_local_provider>
+
+## 安装
+
+在 SakuraMedia 的「系统设置 → 插件」点击「安装插件」，上传本插件的 `.zip` 包；也可以直接从「插件市场」安装。ZIP 可从本仓库 Release 或插件市场下载。安装后确认插件已启用，再重启 SakuraMedia 容器。插件的安装、启停、删除或插件配置修改后，前端都会提示需要重启容器才生效。
+
+## 创建本地媒体库
+
+在「系统设置 → 媒体库」点击「新增媒体库」，将「存储 Provider」设为「本地存储与 qBittorrent」，再填写：
+
+- 名称：媒体库在 SakuraMedia 中的显示名称。
+- 媒体库路径：影片导入后的最终目录，填写已挂载到 SakuraMedia 容器内的路径，例如 `/mnt/sakuramedia-media`。
+- 手动导入根目录：浏览并导入已有本地文件的目录，填写已挂载到 SakuraMedia 容器内的路径，例如 `/mnt/sakuramedia-import`。
+
+这里填写的是 SakuraMedia 容器内的挂载路径，不是宿主机路径。编辑已有媒体库时不能改存储 Provider；需要换 Provider 时，请新建媒体库后再迁移。
+
+## 配置 qBittorrent 下载器
+
+该下载器只接受 magnet 和 `.torrent` 种子，不处理 eD2k 或 HTTP 直链。
+
+先创建上述本地媒体库，再在「系统设置 → 下载器」点击「新建下载器」，选择该媒体库作为「目标媒体库」。下载器不单独选择 Provider，选择媒体库后才会显示 qBittorrent 的配置字段：
+
+- qBittorrent 地址、用户名、密码：qBittorrent WebUI 的连接信息。
+- qBittorrent 保存根目录：qBittorrent 进程看到的下载目录，例如 `/downloads`。
+- 后端下载根目录：SakuraMedia 后端容器看到的同一物理目录，填写已挂载到容器内的路径，例如 `/mnt/sakuramedia-downloads`。
+
+两个下载根目录必须映射到同一个物理目录，路径字符串可以不同，例如 qBittorrent 中的 `/downloads` 对应 SakuraMedia 容器中的 `/mnt/sakuramedia-downloads`。点击「测试配置」会检查 qBittorrent 连接和认证、目录映射及硬链接能力；硬链接不可用时会显示警告，仍可保存，导入时会回退为复制。测试未通过也可以保存，但后续下载或导入可能失败。编辑下载器时，密码留空表示保留原值。
+
+## 导入与播放
+
+手动导入只浏览「手动导入根目录」，qBittorrent 完成后的文件只从「后端下载根目录」读取，两种来源不能互换。导入时保留源文件会优先建立硬链接，不能建立时复制；选择导入后删除源文件时，在提交成功后删除源文件。原地导入不复制也不建立硬链接，媒体直接引用「手动导入根目录」中的源文件，仅支持手动导入目录来源；源文件移动、重命名或内容变化会导致媒体失效，删除媒体记录不会删除源文件。删除 SakuraMedia 中的下载器不会删除 qBittorrent 中已有的下载任务。
+
+在「下载任务」中删除任务时：不勾选「同时删除下载器中的文件」只从 qBittorrent 移除任务；勾选后会删除种子数据和对应的「番号-哈希前 6 位」下载子目录，目录清理失败仅记录日志，不影响任务删除。
+
+本地存储仅支持「后端代理」播放，因此影片详情的「媒体源」不会显示「302直连」切换。
+
+## 多语言
+
+本插件声明 Host API 18，支持 `zh-CN` / `en`：
+
+- 语言包放在 `i18n/zh-CN.json`、`i18n/en.json`；`translations.py` 只负责在
+  插件导入时读取它们并生成静态 `*_i18n` 字典，也提供运行时翻译器
+  `Translator`。
+- 插件名：`manifest.json` 的 `display_name_i18n` +
+  `PluginRegistration.display_name_i18n`；媒体 Provider 的展示名用
+  `LocalMediaProviderBundle.display_name_i18n`。三处都是可选字段，缺失时回退原文。
+- 存储与下载器配置项：`ConfigField` 的 `label_i18n` / `description_i18n` /
+  `hint_i18n`。
+- 任务说明：`JobDefinition.cli_help_i18n`。
+- 运行时文本（导入、扫描、缩略图、清理任务进度，Provider 错误
+  `safe_message`，诊断检查 `message`）：`context.i18n.t(key, default=..., **params)`。
+  翻译器随 `register(context)` 注入媒体 Provider bundle、存储 Provider 和
+  qBittorrent 组件；语言在每次调用时按当前请求/任务上下文解析。
+- 语言包 key 在两个文件中必须完全一致，占位符统一用 `{name}`；中文值就是
+  源码里的原始文案。
+- 新增语言时，在 `i18n/` 增加同名 JSON，并补 manifest / registration 的
+  `display_name_i18n`。
+
+## 清理空目录
+
+手动运行「清理本地媒体库空目录（请在无导入、转移任务时运行）」任务，会清理所有本地媒体库 `jav/`、`videos/` 内的空子目录，保留媒体库根目录及这两个顶层目录。含有任意文件（包括隐藏文件和零字节文件）或符号链接的目录会保留，不跟随符号链接，也不创建缺失的目录。
+
+任务顺序扫描，每个目录只枚举一次，不读取文件内容；随后从深到浅删除空目录。进度展示扫描、清理两个阶段及累计结果；扫描错误和删除失败会明确汇总，具体路径见日志。慢速磁盘调用阻塞时，进度保持不变，调用返回后继续更新。请在没有导入、转移任务运行时执行。
+
+## License
+
+本项目采用 [PolyForm Noncommercial License 1.0.0](./LICENSE)，仅允许非商业用途。
+
+Copyright (C) 2026 tinypinglite
