@@ -2,7 +2,7 @@
 
 把本地目录接入 SakuraMedia 的媒体库，并提供手动导入、qBittorrent 下载、播放、缩略图和片段。
 
-源码：<https://github.com/tinypinglite/sakuramedia_local_provider>
+源码：<https://github.com/tinypinglite/sakuramedia-open-plugins/tree/main/sakuramedia_local_provider>
 
 ## 安装
 

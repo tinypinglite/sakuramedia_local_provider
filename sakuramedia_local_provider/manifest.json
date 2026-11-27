@@ -19,6 +19,6 @@
     "libtorrent>=2.1.1,<3.0.0; sys_platform != 'darwin' or platform_machine == 'arm64'"
   ],
   "author": "SakuraMedia",
-  "homepage": "https://github.com/tinypinglite/sakuramedia_local_provider",
-  "release_api_url": "https://api.github.com/repos/tinypinglite/sakuramedia_local_provider/releases/latest"
+  "homepage": "https://github.com/tinypinglite/sakuramedia-open-plugins",
+  "release_api_url": "https://tinypinglite.github.io/sakuramedia-plugin-market/releases/sakuramedia_local_provider.json"
 }

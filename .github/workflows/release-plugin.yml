@@ -130,7 +130,7 @@ jobs:
             --so-dir dist/so \
             --shim .github/scripts/plugin_shim.py \
             --output-dir dist \
-            --release-api-url "https://api.github.com/repos/tinypinglite/sakuramedia_local_provider/releases/latest"
+            --release-api-url "https://tinypinglite.github.io/sakuramedia-plugin-market/releases/$PLUGIN_ID.json"
       - uses: actions/upload-artifact@v4
         with:
           name: plugin-package
@@ -152,7 +152,10 @@ jobs:
         with:
           name: plugin-package
           path: dist
-      - name: Upload assets to release
+      # zip 只发布在本仓 Releases；插件市场以 source: external 从这里索引
+      # （见 sakuramedia-plugin-market/scripts/build_index.py），因此本仓不需要
+      # 任何能写市场仓的 token。
+      - name: Upload assets to this release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -160,4 +163,5 @@ jobs:
           set -euo pipefail
           test -f "dist/$ZIP_NAME"
           gh release upload "$TAG" "dist/$ZIP_NAME" "dist/$ZIP_NAME.sha256" --clobber
-
+          echo "发布完成：$TAG"
+          echo "市场索引会在下一次 sync-releases 运行时更新（也可在 market 仓手动触发）。"
